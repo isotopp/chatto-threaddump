@@ -250,7 +250,7 @@ def test_missing_configuration_is_reported_before_url_parsing(
 
     assert main(["not a Chatto URL", str(tmp_path / "bundle")]) == 1
     captured = capsys.readouterr()
-    assert "missing Chatto configuration" in captured.err
+    assert "missing Chatto server URL" in captured.err
     assert "invalid Chatto thread URL" not in captured.err
     assert captured.out == ""
 

@@ -70,12 +70,14 @@ def _timeout(value: str) -> float:
 
 
 def _settings(timeout: float, force: bool) -> Settings:
-    if not load_dotenv(".env"):
+    if not load_dotenv(Path.cwd() / ".env"):
         load_dotenv(Path.home() / ".chatto-threaddump.env")
     server_url = os.environ.get("CHATTO_THREADDUMP_SERVER_URL")
     api_key = os.environ.get("CHATTO_THREADDUMP_API_KEY")
-    if not server_url or not api_key:
-        raise ExportError("missing Chatto configuration")
+    if not server_url:
+        raise ExportError("missing Chatto server URL")
+    if not api_key:
+        raise ExportError("missing Chatto API key")
     return Settings(
         server_url=server_url,
         api_key=api_key,
