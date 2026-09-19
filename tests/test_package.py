@@ -788,3 +788,127 @@ def test_rejects_a_missing_pagination_cursor(monkeypatch, tmp_path) -> None:
         == 1
     )
     assert not output.exists()
+
+
+def test_rejects_duplicate_events_across_pages(monkeypatch, tmp_path) -> None:
+    def event(event_id: str, timestamp: str, root: bool = False) -> dict[str, object]:
+        message = {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": "U",
+            "createdAt": timestamp,
+            "body": event_id,
+        }
+        if not root:
+            message["threadRootEventId"] = "E12345678901234"
+        return {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": "U",
+            "createdAt": timestamp,
+            "messagePosted": {"message": message},
+        }
+
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            payload = {
+                "events": [
+                    event("E12345678901234", "2026-09-19T10:00:00Z", root=True),
+                    event("E22345678901234", "2026-09-19T10:01:00Z"),
+                ],
+                "page": {"hasOlder": True, "startCursor": "older"},
+            }
+        else:
+            payload = {
+                "events": [event("E22345678901234", "2026-09-19T10:01:00Z")],
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+
+
+def test_rejects_page_order_inconsistency(monkeypatch, tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "root",
+                            }
+                        },
+                    },
+                    {
+                        "id": "E22345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T09:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E22345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "threadRootEventId": "E12345678901234",
+                                "createdAt": "2026-09-19T09:00:00Z",
+                                "body": "reply",
+                            }
+                        },
+                    },
+                ],
+                "page": {"hasOlder": False, "startCursor": ""},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()

@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -34,6 +35,14 @@ class ChattoLink:
     room_id: str
     message_id: str
     thread_root_id: str | None
+
+
+@dataclass(frozen=True)
+class ValidatedPage:
+    messages: list[dict[str, object]]
+    users: dict[str, object]
+    event_ids: tuple[str, ...]
+    event_times: tuple[datetime, ...]
 
 
 _ROOM_ID = re.compile(r"(?:R[A-Za-z0-9]{14}|[a-f0-9]{14})\Z")
@@ -195,6 +204,16 @@ def _timestamp(value: dict[str, object]) -> str:
     raise ExportError("malformed Chatto response field: creation timestamp")
 
 
+def _timestamp_value(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ExportError("malformed Chatto response timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ExportError("malformed Chatto response timestamp")
+    return parsed
+
+
 def _validate_includes(value: object) -> dict[str, object]:
     if value is None:
         return {}
@@ -229,7 +248,7 @@ def _validate_message(message: object) -> dict[str, object]:
 
 def _validate_thread_page(
     response: dict[str, object], room_id: str, root_id: str, *, initial: bool
-) -> tuple[list[dict[str, object]], dict[str, object]]:
+) -> ValidatedPage:
     events = response.get("events")
     page = response.get("page")
     if not isinstance(events, list) or not isinstance(page, dict):
@@ -240,6 +259,8 @@ def _validate_thread_page(
         raise ExportError("malformed thread response cursor")
     includes = _validate_includes(response.get("includes"))
     messages: list[dict[str, object]] = []
+    event_ids: list[str] = []
+    event_times: list[datetime] = []
     for event in events:
         if not isinstance(event, dict):
             raise ExportError("malformed thread event")
@@ -247,6 +268,10 @@ def _validate_thread_page(
         event_room = _required_string(event.get("roomId"), "event.roomId")
         event_actor = _required_string(event.get("actorId"), "event.actorId")
         event_timestamp = _timestamp(event)
+        event_ids.append(event_id)
+        event_times.append(_timestamp_value(event_timestamp))
+        if len(event_times) > 1 and event_times[-2] > event_times[-1]:
+            raise ExportError("thread events are out of order")
         if event_room != room_id:
             raise ExportError("malformed thread event room")
         posted = event.get("messagePosted")
@@ -274,7 +299,7 @@ def _validate_thread_page(
             raise ExportError("thread root is missing or misplaced")
     elif root_positions:
         raise ExportError("older thread page contains the root")
-    return messages, includes
+    return ValidatedPage(messages, includes, tuple(event_ids), tuple(event_times))
 
 
 def _request_json(
@@ -316,9 +341,11 @@ def _load_thread(
         _THREAD_EVENTS_PATH,
         {"roomId": room_id, "threadRootEventId": root_id, "limit": 500},
     )
-    messages, users = _validate_thread_page(page, room_id, root_id, initial=True)
-    root_message, all_replies = messages[0], messages[1:]
-    all_users = dict(users)
+    first_page = _validate_thread_page(page, room_id, root_id, initial=True)
+    root_message, all_replies = first_page.messages[0], first_page.messages[1:]
+    all_users = dict(first_page.users)
+    seen_event_ids = set(first_page.event_ids)
+    root_time = _timestamp_value(_timestamp(root_message))
     seen_cursors: set[str] = set()
     page_info = page["page"]
     while isinstance(page_info, dict) and page_info["hasOlder"]:
@@ -336,9 +363,18 @@ def _load_thread(
                 "before": cursor,
             },
         )
-        older_messages, older_users = _validate_thread_page(
-            page, room_id, root_id, initial=False
-        )
+        older_page = _validate_thread_page(page, room_id, root_id, initial=False)
+        if any(event_id in seen_event_ids for event_id in older_page.event_ids):
+            raise ExportError("duplicate thread event")
+        seen_event_ids.update(older_page.event_ids)
+        older_messages, older_users = older_page.messages, older_page.users
+        if older_messages:
+            if all_replies:
+                first_reply_time = _timestamp_value(_timestamp(all_replies[0]))
+                if _timestamp_value(_timestamp(older_messages[-1])) > first_reply_time:
+                    raise ExportError("older thread page is out of order")
+            elif _timestamp_value(_timestamp(older_messages[0])) < root_time:
+                raise ExportError("reply precedes thread root")
         all_replies = older_messages + all_replies
         all_users.update(older_users)
         page_info = page["page"]
