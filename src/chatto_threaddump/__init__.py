@@ -14,6 +14,7 @@ import httpx
 from dotenv import dotenv_values
 
 _THREAD_EVENTS_PATH = "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents"
+_GET_MESSAGE_PATH = "/api/connect/chatto.api.v1.MessageService/GetMessage"
 
 
 class ExportError(Exception):
@@ -154,26 +155,14 @@ def _parse_chatto_url(value: str, server_url: str) -> ChattoLink:
     return ChattoLink(room_id, message_id, thread_root_id)
 
 
-def _render_page(page: dict[str, object]) -> str:
-    events = page.get("events")
-    includes = page.get("includes", {})
+def _render_messages(messages: list[dict[str, object]], includes: object = None) -> str:
+    if includes is None:
+        includes = {}
     users = includes.get("users", {}) if isinstance(includes, dict) else {}
-    if not isinstance(events, list) or not isinstance(users, dict):
+    if not isinstance(users, dict):
         raise ExportError("malformed thread response")
 
     rendered = ["# Chatto thread"]
-    messages: list[dict[str, object]] = []
-    for event in events:
-        if not isinstance(event, dict):
-            raise ExportError("malformed thread response")
-        posted = event.get("messagePosted")
-        if not isinstance(posted, dict):
-            continue
-        message = posted.get("message")
-        if not isinstance(message, dict):
-            raise ExportError("malformed thread response")
-        messages.append(message)
-
     if not messages:
         raise ExportError("thread response contains no messages")
     created = messages[0].get("createdAt", messages[0].get("createTime"))
@@ -193,35 +182,87 @@ def _render_page(page: dict[str, object]) -> str:
     return "\n".join(rendered) + "\n"
 
 
-def _export(url: str, output: Path, settings: Settings) -> None:
-    link = _parse_chatto_url(url, settings.server_url)
-    if link.thread_root_id is None:
-        raise ExportError("room-message links are not supported yet")
+def _render_page(page: dict[str, object]) -> str:
+    events = page.get("events")
+    if not isinstance(events, list):
+        raise ExportError("malformed thread response")
+    messages: list[dict[str, object]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise ExportError("malformed thread response")
+        posted = event.get("messagePosted")
+        if not isinstance(posted, dict):
+            continue
+        message = posted.get("message")
+        if not isinstance(message, dict):
+            raise ExportError("malformed thread response")
+        messages.append(message)
+    return _render_messages(messages, page.get("includes", {}))
+
+
+def _request_json(
+    settings: Settings, path: str, payload: dict[str, object]
+) -> dict[str, object]:
     headers = {
         "Authorization": f"Bearer {settings.api_key}",
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
     }
-    request_url = settings.server_url.rstrip("/") + _THREAD_EVENTS_PATH
+    request_url = settings.server_url.rstrip("/") + path
     try:
         with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
-            response = client.post(
-                request_url,
-                headers=headers,
-                json={
+            response = client.post(request_url, headers=headers, json=payload)
+            response.raise_for_status()
+            value = response.json()
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise ExportError("Chatto request failed") from exc
+    if not isinstance(value, dict):
+        raise ExportError("malformed Chatto response")
+    return value
+
+
+def _export(url: str, output: Path, settings: Settings) -> None:
+    link = _parse_chatto_url(url, settings.server_url)
+    if link.thread_root_id is not None:
+        page = _request_json(
+            settings,
+            _THREAD_EVENTS_PATH,
+            {
+                "roomId": link.room_id,
+                "threadRootEventId": link.thread_root_id,
+                "limit": 500,
+            },
+        )
+        content = _render_page(page)
+    else:
+        lookup = _request_json(
+            settings,
+            _GET_MESSAGE_PATH,
+            {"roomId": link.room_id, "eventId": link.message_id},
+        )
+        message = lookup.get("message")
+        if (
+            not isinstance(message, dict)
+            or message.get("id") != link.message_id
+            or message.get("roomId") != link.room_id
+        ):
+            raise ExportError("message lookup did not match the requested message")
+        thread_root_id = message.get("threadRootEventId") or link.message_id
+        if "thread" not in message or message.get("thread") is None:
+            content = _render_messages([message], lookup.get("includes", {}))
+        else:
+            page = _request_json(
+                settings,
+                _THREAD_EVENTS_PATH,
+                {
                     "roomId": link.room_id,
-                    "threadRootEventId": link.thread_root_id,
+                    "threadRootEventId": thread_root_id,
                     "limit": 500,
                 },
             )
-            response.raise_for_status()
-            page = response.json()
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        raise ExportError("Chatto request failed") from exc
-    if not isinstance(page, dict):
-        raise ExportError("malformed thread response")
+            content = _render_page(page)
     output.mkdir(parents=True, exist_ok=False)
-    (output / "_index.md").write_text(_render_page(page), encoding="utf-8")
+    (output / "_index.md").write_text(content, encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:

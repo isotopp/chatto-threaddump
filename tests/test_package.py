@@ -269,36 +269,167 @@ def test_rejects_untrusted_origins_and_malformed_links(
     assert "test-key" not in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    "server_url, chatto_url",
-    [
-        (
-            "https://api.example.test",
-            "https://frontend.example.test/chat/api.example.test/R12345678901234/m/E22345678901234",
-        ),
-        (
-            "https://api.example.test:8443",
-            "https://api.example.test:8443/chat/-/R12345678901234/E22345678901234",
-        ),
-        (
-            "https://api.example.test:8443",
-            "https://api.example.test:8443/chat/-/R12345678901234/m/E22345678901234",
-        ),
-    ],
-)
-def test_accepts_room_message_url_shapes_before_lookup(
-    monkeypatch, tmp_path, capsys, server_url, chatto_url
-) -> None:
-    calls = 0
-    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", server_url)
+def test_resolves_an_unthreaded_room_message(monkeypatch, tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "id": "E22345678901234",
+                    "roomId": "R12345678901234",
+                    "actorId": "U",
+                    "createdAt": "2026-09-19T10:00:00Z",
+                    "body": "Standalone body",
+                },
+                "includes": {"users": {"U": {"displayName": "Author"}}},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
 
-    def client(**kwargs):
-        nonlocal calls
-        calls += 1
-        raise AssertionError("room lookup is deferred to the next ticket")
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert len(requests) == 1
+    assert requests[0].url.path.endswith("MessageService/GetMessage")
+    assert json.loads(requests[0].content) == {
+        "roomId": "R12345678901234",
+        "eventId": "E22345678901234",
+    }
+    assert "Standalone body" in (output / "_index.md").read_text(encoding="utf-8")
 
-    monkeypatch.setattr(httpx, "Client", client)
-    assert main([chatto_url, str(tmp_path / "bundle")]) == 1
-    assert calls == 0
-    assert "room-message links are not supported yet" in capsys.readouterr().err
+
+def test_resolves_a_room_reply_through_its_thread(monkeypatch, tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("MessageService/GetMessage"):
+            payload = {
+                "message": {
+                    "id": "E22345678901234",
+                    "roomId": "R12345678901234",
+                    "actorId": "Ureply",
+                    "threadRootEventId": "E12345678901234",
+                    "createdAt": "2026-09-19T10:01:00Z",
+                    "body": "Reply body",
+                    "thread": {},
+                }
+            }
+        else:
+            payload = {
+                "events": [
+                    {
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Uroot",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "Root body",
+                            }
+                        }
+                    },
+                    {
+                        "messagePosted": {
+                            "message": {
+                                "id": "E22345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Ureply",
+                                "createdAt": "2026-09-19T10:01:00Z",
+                                "body": "Reply body",
+                            }
+                        }
+                    },
+                ],
+                "includes": {
+                    "users": {
+                        "Uroot": {"displayName": "Root"},
+                        "Ureply": {"displayName": "Reply"},
+                    }
+                },
+            }
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://api.example.test/chat/-/R12345678901234/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert len(requests) == 2
+    assert json.loads(requests[1].content) == {
+        "roomId": "R12345678901234",
+        "threadRootEventId": "E12345678901234",
+        "limit": 500,
+    }
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert content.index("Root body") < content.index("Reply body")
+
+
+def test_rejects_a_room_lookup_that_returns_another_message(
+    monkeypatch, tmp_path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "id": "E12345678901234",
+                    "roomId": "R12345678901234",
+                }
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
