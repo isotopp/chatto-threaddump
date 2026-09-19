@@ -12,7 +12,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import SplitResult, quote, urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -84,47 +84,46 @@ def _settings(timeout: float, force: bool) -> Settings:
     )
 
 
-def _origin(value: str, *, require_root_path: bool) -> tuple[str, str, int]:
-    try:
-        parsed = urlsplit(value)
-        port = parsed.port
-    except ValueError as exc:
-        raise ExportError("invalid Chatto server origin") from exc
+def _clean_https_url(value: str, *, allow_query: bool = False) -> SplitResult:
+    parsed = urlsplit(value)
+    _ = parsed.port
     if (
         parsed.scheme.lower() != "https"
         or not parsed.netloc
         or parsed.username is not None
         or parsed.password is not None
         or parsed.hostname is None
-        or parsed.query
+        or (not allow_query and parsed.query)
         or parsed.fragment
-        or (require_root_path and parsed.path not in ("", "/"))
     ):
+        raise ValueError
+    return parsed
+
+
+def _origin(value: str, *, require_root_path: bool) -> tuple[str, str, int]:
+    try:
+        parsed = _clean_https_url(value)
+    except ValueError as exc:
+        raise ExportError("invalid Chatto server origin") from exc
+    if require_root_path and parsed.path not in ("", "/"):
+        raise ExportError("invalid Chatto server origin")
+    port = parsed.port
+    hostname = parsed.hostname
+    if hostname is None:
         raise ExportError("invalid Chatto server origin")
     try:
-        parsed.hostname.encode("ascii")
+        hostname.encode("ascii")
     except UnicodeEncodeError as exc:
         raise ExportError("invalid Chatto server origin") from exc
-    return "https", parsed.hostname.lower(), port or 443
+    return "https", hostname.lower(), port or 443
 
 
 def _parse_chatto_url(value: str, server_url: str) -> ChattoLink:
     configured_origin = _origin(server_url, require_root_path=True)
     try:
-        parsed = urlsplit(value)
-        _ = parsed.port
+        parsed = _clean_https_url(value)
     except ValueError as exc:
         raise ExportError("invalid Chatto URL") from exc
-    if (
-        parsed.scheme.lower() != "https"
-        or not parsed.netloc
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.hostname is None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ExportError("invalid Chatto URL")
     parts = parsed.path.split("/")
     if len(parts) not in (5, 6, 7) or parts[1] != "chat" or not parts[2]:
         raise ExportError("invalid Chatto URL")
@@ -547,17 +546,7 @@ def _download_asset(settings: Settings, value: object) -> bytes:
         raise ExportError("attachment has no usable asset URL")
     url = value["url"]
     try:
-        parsed = urlsplit(url)
-        _ = parsed.port
-        if (
-            parsed.scheme.lower() != "https"
-            or not parsed.netloc
-            or parsed.hostname is None
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.fragment
-        ):
-            raise ValueError
+        _clean_https_url(url, allow_query=True)
         with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
             response = client.get(url)
     except ValueError as exc:
