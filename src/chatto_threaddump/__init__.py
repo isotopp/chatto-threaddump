@@ -500,7 +500,15 @@ def _download_asset(settings: Settings, value: object) -> bytes:
     url = value["url"]
     try:
         parsed = urlsplit(url)
-        if parsed.scheme.lower() != "https" or not parsed.netloc:
+        _ = parsed.port
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.netloc
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
             raise ValueError
         with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
             response = client.get(url)

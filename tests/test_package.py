@@ -1491,3 +1491,144 @@ def test_failed_force_export_preserves_existing_output(monkeypatch, tmp_path) ->
         == 1
     )
     assert (output / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize(
+    "asset_url",
+    [
+        None,
+        {"url": "http://assets.example/file"},
+        {"url": "https://user:secret@assets.example/file"},
+    ],
+)
+def test_rejects_unusable_attachment_urls_without_publishing(
+    monkeypatch, tmp_path, asset_url
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = {
+            "events": [
+                {
+                    "id": "E12345678901234",
+                    "roomId": "R12345678901234",
+                    "actorId": "U",
+                    "createdAt": "2026-09-19T10:00:00Z",
+                    "messagePosted": {
+                        "message": {
+                            "id": "E12345678901234",
+                            "roomId": "R12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "attachments": [
+                                {
+                                    "filename": "file.txt",
+                                    "mimeType": "text/plain",
+                                    "assetUrl": asset_url,
+                                }
+                            ],
+                        }
+                    },
+                }
+            ],
+            "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+            "page": {"hasOlder": False, "startCursor": ""},
+        }
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+
+
+def test_redirected_or_late_failed_asset_preserves_existing_output(
+    monkeypatch, tmp_path
+) -> None:
+    output = tmp_path / "bundle"
+    output.mkdir()
+    (output / "sentinel.txt").write_text("keep", encoding="utf-8")
+    asset_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("ThreadService/GetThreadEvents"):
+            payload = {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "attachments": [
+                                    {
+                                        "filename": "first.txt",
+                                        "mimeType": "text/plain",
+                                        "assetUrl": {
+                                            "url": "https://assets.example/first"
+                                        },
+                                    },
+                                    {
+                                        "filename": "second.txt",
+                                        "mimeType": "text/plain",
+                                        "assetUrl": {
+                                            "url": "https://assets.example/second"
+                                        },
+                                    },
+                                ],
+                            }
+                        },
+                    }
+                ],
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+            return httpx.Response(200, json=payload, request=request)
+        asset_requests.append(request)
+        if request.url.path.endswith("second"):
+            return httpx.Response(
+                302,
+                headers={"location": "https://other.example/redirected?sig=fake"},
+                request=request,
+            )
+        return httpx.Response(200, content=b"first", request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert (
+        main(
+            [
+                "--force",
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert len(asset_requests) == 2
+    assert (output / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+    assert not (output / "first.txt").exists()
