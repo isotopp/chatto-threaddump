@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -176,28 +177,59 @@ def _render_messages(messages: list[dict[str, object]], users: object = None) ->
     rendered = ["# Chatto thread"]
     if not messages:
         raise ExportError("thread response contains no messages")
-    created = messages[0].get("createdAt", messages[0].get("createTime"))
-    if not isinstance(created, str):
-        raise ExportError("malformed thread response")
-    rendered.extend(("", f"Started: {created}"))
+    rendered.extend(
+        ("", f"Started: {_escape_metadata(_clean_text(_timestamp(messages[0])))}")
+    )
     for message in messages:
-        actor_id = message.get("actorId")
+        actor_id = _required_string(message.get("actorId"), "message.actorId")
         user = users.get(actor_id, {})
         if not isinstance(user, dict):
             user = {}
-        display_name = user.get("displayName")
-        login = user.get("login")
-        if isinstance(display_name, str) and display_name.strip():
-            author = display_name
-        elif isinstance(login, str) and login.strip():
-            author = login if login.startswith("@") else f"@{login}"
-        else:
-            author = "Unknown author"
-        body = message.get("body", "")
-        if not isinstance(author, str) or not isinstance(body, str):
-            raise ExportError("malformed thread response")
-        rendered.extend(("", f"## {author}", "", body))
+        author = _author_label(user)
+        rendered.extend(("", f"## {author}", "", _message_body(message)))
     return "\n".join(rendered) + "\n"
+
+
+def _clean_text(value: str) -> str:
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(
+        character
+        for character in value
+        if character in "\n\t" or not unicodedata.category(character).startswith("C")
+    )
+
+
+def _escape_metadata(value: str) -> str:
+    value = value.replace("\\", "\\\\")
+    return re.sub(r"([`*_\[\]()#+])", r"\\\1", value)
+
+
+def _author_label(user: dict[str, object]) -> str:
+    display_name = user.get("displayName")
+    if isinstance(display_name, str):
+        normalized = " ".join(_clean_text(display_name).split())
+        if normalized:
+            return _escape_metadata(normalized)
+    login = user.get("login")
+    if isinstance(login, str):
+        normalized = " ".join(_clean_text(login).split()).lstrip("@")
+        if normalized:
+            return _escape_metadata(f"@{normalized}")
+    return "Unknown author"
+
+
+def _message_body(message: dict[str, object]) -> str:
+    if "body" in message:
+        body = message["body"]
+        if not isinstance(body, str):
+            raise ExportError("malformed message body")
+        return _clean_text(body)
+    deleted_at = message.get("deletedAt")
+    if deleted_at is not None and not isinstance(deleted_at, str):
+        raise ExportError("malformed deletion timestamp")
+    if deleted_at:
+        return "_[message deleted]_"
+    return "_[message body unavailable]_"
 
 
 def _required_string(value: object, field: str) -> str:

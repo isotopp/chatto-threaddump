@@ -1090,6 +1090,128 @@ def test_omitted_batch_users_use_unknown_author(monkeypatch, tmp_path) -> None:
     assert "U0" not in content
 
 
+def test_normalizes_untrusted_text_without_escaping_message_markdown(
+    monkeypatch, tmp_path
+) -> None:
+    def message_event(
+        event_id: str,
+        actor_id: str,
+        timestamp: str,
+        message: dict[str, object],
+    ) -> dict[str, object]:
+        return {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": actor_id,
+            "createdAt": timestamp,
+            "messagePosted": {"message": message},
+        }
+
+    def message(
+        event_id: str,
+        actor_id: str,
+        timestamp: str,
+        **extra: object,
+    ) -> dict[str, object]:
+        value: dict[str, object] = {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": actor_id,
+            "createdAt": timestamp,
+            **extra,
+        }
+        if event_id != "E12345678901234":
+            value["threadRootEventId"] = "E12345678901234"
+        return value
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events = [
+            message_event(
+                "E12345678901234",
+                "U1",
+                "2026-09-19T10:00:00Z",
+                message(
+                    "E12345678901234",
+                    "U1",
+                    "2026-09-19T10:00:00Z",
+                    body="line\r\n\t*markdown*\x1b",
+                ),
+            ),
+            message_event(
+                "E22345678901234",
+                "U2",
+                "2026-09-19T10:01:00Z",
+                message(
+                    "E22345678901234",
+                    "U2",
+                    "2026-09-19T10:01:00Z",
+                    body="",
+                ),
+            ),
+            message_event(
+                "E32345678901234",
+                "U3",
+                "2026-09-19T10:02:00Z",
+                message(
+                    "E32345678901234",
+                    "U3",
+                    "2026-09-19T10:02:00Z",
+                    deletedAt="2026-09-19T10:03:00Z",
+                ),
+            ),
+            message_event(
+                "E42345678901234",
+                "U4",
+                "2026-09-19T10:03:00Z",
+                message("E42345678901234", "U4", "2026-09-19T10:03:00Z"),
+            ),
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "events": events,
+                "includes": {
+                    "users": {
+                        "U1": {"id": "U1", "displayName": "  Alice\n#  "},
+                        "U2": {"id": "U2", "login": "  bob\t"},
+                        "U3": {"id": "U3", "displayName": "Deleted"},
+                        "U4": {"id": "U4", "displayName": "Unavailable"},
+                    }
+                },
+                "page": {"hasOlder": False, "startCursor": ""},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert "Started: 2026-09-19T10:00:00Z" in content
+    assert "## Alice \\#" in content
+    assert "line\n\t*markdown*" in content
+    assert "## @bob" in content
+    assert "_[message deleted]_" in content
+    assert "_[message body unavailable]_" in content
+    assert "\x1b" not in content
+    assert "U1" not in content
+
+
 def test_existing_output_blocks_network_without_force(monkeypatch, tmp_path) -> None:
     output = tmp_path / "bundle"
     output.mkdir()
