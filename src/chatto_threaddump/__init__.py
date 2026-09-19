@@ -2,18 +2,66 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
+from dotenv import dotenv_values
 
 _THREAD_EVENTS_PATH = "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents"
 
 
 class ExportError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class Settings:
+    server_url: str
+    api_key: str
+    timeout: float
+    force: bool
+
+
+def _timeout(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "timeout must be a positive finite number"
+        ) from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("timeout must be a positive finite number")
+    return parsed
+
+
+def _settings(timeout: float, force: bool) -> Settings:
+    values = {
+        "CHATTO_THREADDUMP_SERVER_URL": os.environ.get("CHATTO_THREADDUMP_SERVER_URL"),
+        "CHATTO_THREADDUMP_API_KEY": os.environ.get("CHATTO_THREADDUMP_API_KEY"),
+    }
+    env_path = Path.cwd() / ".env"
+    if not env_path.exists():
+        env_path = Path.home() / ".chatto-threaddump.env"
+    if env_path.is_file():
+        for key, value in dotenv_values(env_path).items():
+            if key in values and values[key] is None and isinstance(value, str):
+                values[key] = value
+    if (
+        not values["CHATTO_THREADDUMP_SERVER_URL"]
+        or not values["CHATTO_THREADDUMP_API_KEY"]
+    ):
+        raise ExportError("missing Chatto configuration")
+    return Settings(
+        server_url=values["CHATTO_THREADDUMP_SERVER_URL"],
+        api_key=values["CHATTO_THREADDUMP_API_KEY"],
+        timeout=timeout,
+        force=force,
+    )
 
 
 def _parse_thread_url(value: str) -> tuple[str, str]:
@@ -75,20 +123,16 @@ def _render_page(page: dict[str, object]) -> str:
     return "\n".join(rendered) + "\n"
 
 
-def _export(url: str, output: Path) -> None:
-    server_url = os.environ.get("CHATTO_THREADDUMP_SERVER_URL", "")
-    api_key = os.environ.get("CHATTO_THREADDUMP_API_KEY", "")
-    if not server_url or not api_key:
-        raise ExportError("missing Chatto configuration")
+def _export(url: str, output: Path, settings: Settings) -> None:
     room_id, root_id = _parse_thread_url(url)
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {settings.api_key}",
         "Content-Type": "application/json",
         "Connect-Protocol-Version": "1",
     }
-    request_url = server_url.rstrip("/") + _THREAD_EVENTS_PATH
+    request_url = settings.server_url.rstrip("/") + _THREAD_EVENTS_PATH
     try:
-        with httpx.Client(follow_redirects=False, timeout=5.0) as client:
+        with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
             response = client.post(
                 request_url,
                 headers=headers,
@@ -106,11 +150,14 @@ def _export(url: str, output: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="chatto-threaddump")
+    parser.add_argument("-f", "--force", action="store_true")
+    parser.add_argument("-t", "--timeout", type=_timeout, default=5.0)
     parser.add_argument("chatto_url")
     parser.add_argument("output_directory", type=Path)
     args = parser.parse_args(argv)
     try:
-        _export(args.chatto_url, args.output_directory)
+        settings = _settings(args.timeout, args.force)
+        _export(args.chatto_url, args.output_directory, settings)
     except (ExportError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
