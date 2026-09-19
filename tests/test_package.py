@@ -1,6 +1,7 @@
 import json
 
 import httpx
+import pytest
 
 from chatto_threaddump import main
 
@@ -20,11 +21,11 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
             json={
                 "events": [
                     {
-                        "id": "Eroot000000000",
+                        "id": "E12345678901234",
                         "messagePosted": {
                             "message": {
-                                "id": "Eroot000000000",
-                                "roomId": "Rroom000000000",
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
                                 "actorId": "Uroot",
                                 "createdAt": "2026-09-19T10:00:00Z",
                                 "body": "Root body",
@@ -32,11 +33,11 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
                         },
                     },
                     {
-                        "id": "Ereply00000000",
+                        "id": "E22345678901234",
                         "messagePosted": {
                             "message": {
-                                "id": "Ereply00000000",
-                                "roomId": "Rroom000000000",
+                                "id": "E22345678901234",
+                                "roomId": "R12345678901234",
                                 "actorId": "Ureply",
                                 "createdAt": "2026-09-19T10:01:00Z",
                                 "body": "Reply body",
@@ -72,7 +73,7 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
     assert (
         main(
             [
-                "https://frontend.example.test/chat/api.example.test/Rroom000000000/Eroot000000000/m/Ereply00000000",
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
                 str(output),
             ]
         )
@@ -95,8 +96,8 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
     )
     assert requests[0].headers["Authorization"] == "Bearer test-key"
     assert json.loads(requests[0].content) == {
-        "roomId": "Rroom000000000",
-        "threadRootEventId": "Eroot000000000",
+        "roomId": "R12345678901234",
+        "threadRootEventId": "E12345678901234",
         "limit": 500,
     }
     assert client_options["timeout"] == 5.0
@@ -149,7 +150,7 @@ def test_process_environment_overrides_dotenv_and_timeout_is_configurable(
                 "--force",
                 "-t",
                 "1.25",
-                "https://frontend.example.test/chat/api.example.test/Rroom000000000/Eroot000000000/m/Ereply00000000",
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
                 str(tmp_path / "bundle"),
             ]
         )
@@ -198,7 +199,7 @@ def test_dotenv_supplies_missing_process_configuration(monkeypatch, tmp_path) ->
     assert (
         main(
             [
-                "https://frontend.example.test/chat/api.example.test/Rroom000000000/Eroot000000000/m/Ereply00000000",
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
                 str(tmp_path / "bundle"),
             ]
         )
@@ -219,3 +220,85 @@ def test_missing_configuration_is_reported_before_url_parsing(
     assert "missing Chatto configuration" in captured.err
     assert "invalid Chatto thread URL" not in captured.err
     assert captured.out == ""
+
+
+@pytest.mark.parametrize(
+    "server_url, chatto_url",
+    [
+        (
+            "http://api.example.test",
+            "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+        ),
+        (
+            "https://api.example.test/private",
+            "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+        ),
+        (
+            "https://api.example.test",
+            "https://frontend.example.test/chat/other.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+        ),
+        (
+            "https://api.example.test",
+            "https://frontend.example.test/chat/api.example.test/R1234567890123%2F4/E12345678901234/m/E22345678901234",
+        ),
+        (
+            "https://api.example.test",
+            "https://user:secret@frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+        ),
+        (
+            "https://api.example.test",
+            "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234?x=1",
+        ),
+    ],
+)
+def test_rejects_untrusted_origins_and_malformed_links(
+    monkeypatch, tmp_path, capsys, server_url, chatto_url
+) -> None:
+    calls = 0
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", server_url)
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+
+    def client(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid input must not create an HTTP client")
+
+    monkeypatch.setattr(httpx, "Client", client)
+    assert main([chatto_url, str(tmp_path / "bundle")]) == 1
+    assert calls == 0
+    assert "test-key" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "server_url, chatto_url",
+    [
+        (
+            "https://api.example.test",
+            "https://frontend.example.test/chat/api.example.test/R12345678901234/m/E22345678901234",
+        ),
+        (
+            "https://api.example.test:8443",
+            "https://api.example.test:8443/chat/-/R12345678901234/E22345678901234",
+        ),
+        (
+            "https://api.example.test:8443",
+            "https://api.example.test:8443/chat/-/R12345678901234/m/E22345678901234",
+        ),
+    ],
+)
+def test_accepts_room_message_url_shapes_before_lookup(
+    monkeypatch, tmp_path, capsys, server_url, chatto_url
+) -> None:
+    calls = 0
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", server_url)
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+
+    def client(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("room lookup is deferred to the next ticket")
+
+    monkeypatch.setattr(httpx, "Client", client)
+    assert main([chatto_url, str(tmp_path / "bundle")]) == 1
+    assert calls == 0
+    assert "room-message links are not supported yet" in capsys.readouterr().err
