@@ -10,6 +10,17 @@ def test_console_entry_point_exists() -> None:
     assert callable(main)
 
 
+def test_help_describes_arguments_without_configuration(capsys) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(["--help"])
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "chatto_url" in help_text
+    assert "output_directory" in help_text
+    assert "--force" in help_text and "-f" in help_text
+    assert "--timeout" in help_text and "-t" in help_text
+
+
 def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
     requests: list[httpx.Request] = []
     client_options: dict[str, object] = {}

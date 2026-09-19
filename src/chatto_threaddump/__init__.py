@@ -669,11 +669,26 @@ def _export(url: str, output: Path, settings: Settings) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="chatto-threaddump")
-    parser.add_argument("-f", "--force", action="store_true")
-    parser.add_argument("-t", "--timeout", type=_timeout, default=5.0)
-    parser.add_argument("chatto_url")
-    parser.add_argument("output_directory", type=Path)
+    parser = argparse.ArgumentParser(
+        prog="chatto-threaddump",
+        description="Export one Chatto thread as a complete Markdown bundle.",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="replace an existing output directory after a successful export",
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=_timeout,
+        default=5.0,
+        metavar="SECONDS",
+        help="positive finite network timeout (default: 5)",
+    )
+    parser.add_argument("chatto_url", help="absolute Chatto message or thread URL")
+    parser.add_argument("output_directory", type=Path, help="directory for the bundle")
     args = parser.parse_args(argv)
     try:
         settings = _settings(args.timeout, args.force)
