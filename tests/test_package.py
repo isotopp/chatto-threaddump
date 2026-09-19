@@ -912,3 +912,112 @@ def test_rejects_page_order_inconsistency(monkeypatch, tmp_path) -> None:
         == 1
     )
     assert not output.exists()
+
+
+def test_existing_output_blocks_network_without_force(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "bundle"
+    output.mkdir()
+    (output / "sentinel.txt").write_text("keep", encoding="utf-8")
+    calls = 0
+
+    def client(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("existing output must be checked before networking")
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    monkeypatch.setattr(httpx, "Client", client)
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert calls == 0
+    assert (output / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_force_replaces_existing_output_after_success(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "bundle"
+    output.mkdir()
+    (output / "sentinel.txt").write_text("remove", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "new",
+                            }
+                        },
+                    }
+                ],
+                "page": {"hasOlder": False, "startCursor": ""},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert (
+        main(
+            [
+                "--force",
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert not (output / "sentinel.txt").exists()
+    assert "new" in (output / "_index.md").read_text(encoding="utf-8")
+
+
+def test_failed_force_export_preserves_existing_output(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "bundle"
+    output.mkdir()
+    (output / "sentinel.txt").write_text("keep", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert (
+        main(
+            [
+                "--force",
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert (output / "sentinel.txt").read_text(encoding="utf-8") == "keep"

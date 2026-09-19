@@ -5,7 +5,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -381,7 +383,51 @@ def _load_thread(
     return [root_message, *all_replies], all_users
 
 
+def _check_output_path(output: Path, force: bool) -> None:
+    if output.is_symlink() or output.exists():
+        if not output.is_dir():
+            raise ExportError("output path is not a directory")
+        if not force:
+            raise ExportError("output directory already exists; use --force")
+
+
+def _publish(content: str, output: Path, force: bool) -> None:
+    existing_parent = output.parent
+    while not existing_parent.exists():
+        existing_parent = existing_parent.parent
+    if not existing_parent.is_dir():
+        raise ExportError("output parent is not a directory")
+
+    staged = Path(tempfile.mkdtemp(prefix=f".{output.name}-", dir=existing_parent))
+    backup: Path | None = None
+    try:
+        (staged / "_index.md").write_text(content, encoding="utf-8")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if force and (output.is_symlink() or output.exists()):
+            backup = Path(
+                tempfile.mkdtemp(prefix=f".{output.name}-backup-", dir=output.parent)
+            )
+            backup.rmdir()
+            os.replace(output, backup)
+        try:
+            os.replace(staged, output)
+        except OSError:
+            if backup is not None and not output.exists():
+                os.replace(backup, output)
+                backup = None
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+            backup = None
+    finally:
+        if staged.exists():
+            shutil.rmtree(staged)
+        if backup is not None and backup.exists() and not output.exists():
+            os.replace(backup, output)
+
+
 def _export(url: str, output: Path, settings: Settings) -> None:
+    _check_output_path(output, settings.force)
     link = _parse_chatto_url(url, settings.server_url)
     if link.thread_root_id is not None:
         messages, includes = _load_thread(settings, link.room_id, link.thread_root_id)
@@ -401,8 +447,7 @@ def _export(url: str, output: Path, settings: Settings) -> None:
         else:
             messages, includes = _load_thread(settings, link.room_id, thread_root_id)
             content = _render_messages(messages, {"users": includes})
-    output.mkdir(parents=True, exist_ok=False)
-    (output / "_index.md").write_text(content, encoding="utf-8")
+    _publish(content, output, settings.force)
 
 
 def main(argv: list[str] | None = None) -> int:
