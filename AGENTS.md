@@ -23,12 +23,19 @@ Keep runtime dependencies in `[project].dependencies` and development tools in
 
 ## Development workflow
 
-`developer/2026-09-19-thread-dump/user-stories.md` is the behavior source of
-truth. Follow its repository handover: approve and commit the user stories,
-derive and approve `tickets.md`, then implement tickets in order. Use one
-behavior-focused failing test at a time, write the minimum code that passes it,
-run all checks, and commit each completed ticket separately. Re-approve ticket
-scope before implementing newly discovered behavior.
+The development workflow uses skills, which are provided in `.agents/skills`.
+
+The specialization workflow creates epics in `./developer`, dated and with a slug.
+An example of such an epic is `developer/2026-09-19-thread-dump/user-stories.md`.
+
+The specialization workflow skill explains the process:
+- creation of a `user-stories.md` to define the expected behavior in a structured way.
+- creation of a `tickets.md` from that file, in actionable tickets of an implementable size, in dependency order.
+
+Both steps profit immensely from a high tier LLM; here ChatGPT-5.6 Sol/medium was used.
+
+The tickets can then be implemented, in order, with a commit before moving on to the next ticket.
+This does no longer require a high tier model, here ChatGPT-5.6 Luna/xhigh was used.
 
 Prefer the standard library and existing dependencies. Add a dependency only
 when an observed requirement justifies it. Keep the CLI stateless, one-shot,
