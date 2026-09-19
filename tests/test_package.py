@@ -1743,3 +1743,53 @@ def test_classifies_network_timeouts(monkeypatch, tmp_path, capsys) -> None:
     captured = capsys.readouterr()
     assert "network timeout" in captured.err
     assert "private timeout details" not in captured.err
+
+
+def test_accepts_live_chatto_page_envelope(monkeypatch, tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "startCursor": "opaque-start",
+                    "endCursor": "opaque-end",
+                }
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )

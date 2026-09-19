@@ -296,6 +296,34 @@ def _validate_message(message: object) -> dict[str, object]:
     return message
 
 
+def _normalize_thread_page(
+    response: dict[str, object], room_id: str
+) -> dict[str, object]:
+    if "events" in response:
+        return response
+    page = response.get("page")
+    if not isinstance(page, dict):
+        raise ExportError("malformed thread response")
+    events = page.get("events", [])
+    if not isinstance(events, list):
+        raise ExportError("malformed thread response")
+    normalized_events = [
+        {**event, "roomId": room_id}
+        if isinstance(event, dict) and "roomId" not in event
+        else event
+        for event in events
+    ]
+    has_older = page.get("hasOlder", len(events) >= 500)
+    return {
+        "events": normalized_events,
+        "includes": page.get("includes", {}),
+        "page": {
+            "hasOlder": has_older,
+            "startCursor": page.get("startCursor", ""),
+        },
+    }
+
+
 def _validate_thread_page(
     response: dict[str, object], room_id: str, root_id: str, *, initial: bool
 ) -> ValidatedPage:
@@ -409,10 +437,13 @@ def _validate_lookup(
 def _load_thread(
     settings: Settings, room_id: str, root_id: str
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    page = _request_json(
-        settings,
-        _THREAD_EVENTS_PATH,
-        {"roomId": room_id, "threadRootEventId": root_id, "limit": 500},
+    page = _normalize_thread_page(
+        _request_json(
+            settings,
+            _THREAD_EVENTS_PATH,
+            {"roomId": room_id, "threadRootEventId": root_id, "limit": 500},
+        ),
+        room_id,
     )
     first_page = _validate_thread_page(page, room_id, root_id, initial=True)
     root_message, all_replies = first_page.messages[0], first_page.messages[1:]
@@ -426,15 +457,18 @@ def _load_thread(
         if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
             raise ExportError("invalid thread pagination cursor")
         seen_cursors.add(cursor)
-        page = _request_json(
-            settings,
-            _THREAD_EVENTS_PATH,
-            {
-                "roomId": room_id,
-                "threadRootEventId": root_id,
-                "limit": 500,
-                "before": cursor,
-            },
+        page = _normalize_thread_page(
+            _request_json(
+                settings,
+                _THREAD_EVENTS_PATH,
+                {
+                    "roomId": room_id,
+                    "threadRootEventId": root_id,
+                    "limit": 500,
+                    "before": cursor,
+                },
+            ),
+            room_id,
         )
         older_page = _validate_thread_page(page, room_id, root_id, initial=False)
         if any(event_id in seen_event_ids for event_id in older_page.event_ids):
