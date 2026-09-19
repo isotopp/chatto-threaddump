@@ -308,21 +308,47 @@ def _validate_lookup(
     return message
 
 
-def _export(url: str, output: Path, settings: Settings) -> None:
-    link = _parse_chatto_url(url, settings.server_url)
-    if link.thread_root_id is not None:
+def _load_thread(
+    settings: Settings, room_id: str, root_id: str
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    page = _request_json(
+        settings,
+        _THREAD_EVENTS_PATH,
+        {"roomId": room_id, "threadRootEventId": root_id, "limit": 500},
+    )
+    messages, users = _validate_thread_page(page, room_id, root_id, initial=True)
+    root_message, all_replies = messages[0], messages[1:]
+    all_users = dict(users)
+    seen_cursors: set[str] = set()
+    page_info = page["page"]
+    while isinstance(page_info, dict) and page_info["hasOlder"]:
+        cursor = page_info.get("startCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            raise ExportError("invalid thread pagination cursor")
+        seen_cursors.add(cursor)
         page = _request_json(
             settings,
             _THREAD_EVENTS_PATH,
             {
-                "roomId": link.room_id,
-                "threadRootEventId": link.thread_root_id,
+                "roomId": room_id,
+                "threadRootEventId": root_id,
                 "limit": 500,
+                "before": cursor,
             },
         )
-        messages, includes = _validate_thread_page(
-            page, link.room_id, link.thread_root_id, initial=True
+        older_messages, older_users = _validate_thread_page(
+            page, room_id, root_id, initial=False
         )
+        all_replies = older_messages + all_replies
+        all_users.update(older_users)
+        page_info = page["page"]
+    return [root_message, *all_replies], all_users
+
+
+def _export(url: str, output: Path, settings: Settings) -> None:
+    link = _parse_chatto_url(url, settings.server_url)
+    if link.thread_root_id is not None:
+        messages, includes = _load_thread(settings, link.room_id, link.thread_root_id)
         content = _render_messages(messages, {"users": includes})
     else:
         lookup = _request_json(
@@ -337,18 +363,7 @@ def _export(url: str, output: Path, settings: Settings) -> None:
         if "thread" not in message or message.get("thread") is None:
             content = _render_messages([message], lookup.get("includes", {}))
         else:
-            page = _request_json(
-                settings,
-                _THREAD_EVENTS_PATH,
-                {
-                    "roomId": link.room_id,
-                    "threadRootEventId": thread_root_id,
-                    "limit": 500,
-                },
-            )
-            messages, includes = _validate_thread_page(
-                page, link.room_id, thread_root_id, initial=True
-            )
+            messages, includes = _load_thread(settings, link.room_id, thread_root_id)
             content = _render_messages(messages, {"users": includes})
     output.mkdir(parents=True, exist_ok=False)
     (output / "_index.md").write_text(content, encoding="utf-8")

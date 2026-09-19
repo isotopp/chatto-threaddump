@@ -570,3 +570,221 @@ def test_ignores_a_well_formed_non_message_event(monkeypatch, tmp_path) -> None:
         == 0
     )
     assert (output / "_index.md").exists()
+
+
+def test_prepends_older_pages_and_merges_page_users(monkeypatch, tmp_path) -> None:
+    requests: list[httpx.Request] = []
+
+    def message_event(
+        event_id: str, actor_id: str, timestamp: str, body: str, root: bool = False
+    ):
+        message = {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": actor_id,
+            "createdAt": timestamp,
+            "body": body,
+        }
+        if not root:
+            message["threadRootEventId"] = "E12345678901234"
+        return {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": actor_id,
+            "createdAt": timestamp,
+            "messagePosted": {"message": message},
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            payload = {
+                "events": [
+                    message_event(
+                        "E12345678901234",
+                        "Uroot",
+                        "2026-09-19T10:00:00Z",
+                        "Root",
+                        root=True,
+                    ),
+                    message_event(
+                        "E22345678901234",
+                        "Unew",
+                        "2026-09-19T10:02:00Z",
+                        "Newest",
+                    ),
+                ],
+                "includes": {
+                    "users": {
+                        "Uroot": {"id": "Uroot", "displayName": "Root"},
+                        "Unew": {"id": "Unew", "displayName": "Newest author"},
+                    }
+                },
+                "page": {"hasOlder": True, "startCursor": "cursor-older"},
+            }
+        else:
+            payload = {
+                "events": [
+                    message_event(
+                        "E32345678901234",
+                        "Uold",
+                        "2026-09-19T10:01:00Z",
+                        "Older",
+                    )
+                ],
+                "includes": {
+                    "users": {"Uold": {"id": "Uold", "displayName": "Older author"}}
+                },
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert len(requests) == 2
+    assert json.loads(requests[1].content) == {
+        "roomId": "R12345678901234",
+        "threadRootEventId": "E12345678901234",
+        "limit": 500,
+        "before": "cursor-older",
+    }
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert content.index("Root") < content.index("Older") < content.index("Newest")
+    assert "Older author" in content and "Newest author" in content
+
+
+def test_rejects_missing_or_repeated_pagination_cursors(monkeypatch, tmp_path) -> None:
+    responses = [
+        {
+            "events": [
+                {
+                    "id": "E12345678901234",
+                    "roomId": "R12345678901234",
+                    "actorId": "Uroot",
+                    "createdAt": "2026-09-19T10:00:00Z",
+                    "messagePosted": {
+                        "message": {
+                            "id": "E12345678901234",
+                            "roomId": "R12345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "body": "root",
+                        }
+                    },
+                }
+            ],
+            "page": {"hasOlder": True, "startCursor": "same"},
+        },
+        {
+            "events": [
+                {
+                    "id": "E22345678901234",
+                    "roomId": "R12345678901234",
+                    "actorId": "Ureply",
+                    "createdAt": "2026-09-19T10:01:00Z",
+                    "messagePosted": {
+                        "message": {
+                            "id": "E22345678901234",
+                            "roomId": "R12345678901234",
+                            "actorId": "Ureply",
+                            "threadRootEventId": "E12345678901234",
+                            "createdAt": "2026-09-19T10:01:00Z",
+                            "body": "reply",
+                        }
+                    },
+                }
+            ],
+            "page": {"hasOlder": True, "startCursor": "same"},
+        },
+    ]
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = responses[min(len(requests) - 1, 1)]
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+
+
+def test_rejects_a_missing_pagination_cursor(monkeypatch, tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Uroot",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "root",
+                            }
+                        },
+                    }
+                ],
+                "page": {"hasOlder": True},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
