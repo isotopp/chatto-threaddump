@@ -12,7 +12,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 from dotenv import dotenv_values
@@ -467,8 +467,31 @@ def _hydrate_authors(
 def _attachment_name(value: object) -> str:
     if not isinstance(value, str):
         return "attachment"
-    name = Path(_clean_text(value)).name
+    cleaned = " ".join(_clean_text(value).split()).replace("\\", "/")
+    name = cleaned.rsplit("/", 1)[-1]
     return name if name not in ("", ".", "..") else "attachment"
+
+
+def _unique_attachment_name(name: str, used: set[str]) -> str:
+    if name != "_index.md" and name not in used:
+        used.add(name)
+        return name
+    path = Path(name)
+    suffix = path.suffix
+    stem = name[: -len(suffix)] if suffix else name
+    index = 1
+    while True:
+        candidate = f"{stem}.{index}{suffix}"
+        if candidate not in used and candidate != "_index.md":
+            used.add(candidate)
+            return candidate
+        index += 1
+
+
+def _mime_type(value: object) -> str:
+    if not isinstance(value, str):
+        raise ExportError("malformed attachment MIME type")
+    return " ".join(_clean_text(value).split())
 
 
 def _download_asset(settings: Settings, value: object) -> bytes:
@@ -492,6 +515,7 @@ def _collect_attachments(
 ) -> tuple[dict[str, list[str]], list[tuple[str, bytes]]]:
     links: dict[str, list[str]] = {}
     files: list[tuple[str, bytes]] = []
+    used_names = {"_index.md"}
     for message in messages:
         message_id = _required_string(message.get("id"), "message.id")
         raw_attachments = message.get("attachments", [])
@@ -500,23 +524,27 @@ def _collect_attachments(
         for attachment in raw_attachments:
             if not isinstance(attachment, dict):
                 raise ExportError("malformed attachment")
-            filename = _attachment_name(attachment.get("filename"))
-            mime_type = attachment.get("mimeType", "application/octet-stream")
-            if not isinstance(mime_type, str):
-                raise ExportError("malformed attachment MIME type")
+            filename = _unique_attachment_name(
+                _attachment_name(attachment.get("filename")), used_names
+            )
+            mime_type = _mime_type(
+                attachment.get("mimeType", "application/octet-stream")
+            )
             description = attachment.get("description", "")
             if description is None:
                 description = ""
             if not isinstance(description, str):
                 raise ExportError("malformed attachment description")
             data = _download_asset(settings, attachment.get("assetUrl"))
-            label = _clean_text(description) or filename
+            clean_description = _clean_text(description)
+            target = quote(filename, safe="")
+            label = clean_description or filename
             if mime_type.lower().startswith("image/"):
-                link = f"![{_escape_metadata(label)}]({filename})"
+                link = f"![{_escape_metadata(label)}]({target})"
             else:
-                link = f"[{_escape_metadata(filename)}]({filename})"
-                if description:
-                    link += f" — {_escape_metadata(_clean_text(description))}"
+                link = f"[{_escape_metadata(filename)}]({target})"
+                if clean_description:
+                    link += f" — {_escape_metadata(clean_description)}"
             links.setdefault(message_id, []).append(link)
             files.append((filename, data))
     return links, files

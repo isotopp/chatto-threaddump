@@ -1290,6 +1290,99 @@ def test_downloads_and_renders_ordered_attachments_without_api_auth(
     assert all("Authorization" not in request.headers for request in asset_requests)
 
 
+def test_attachment_names_are_safe_unique_and_percent_encoded(
+    monkeypatch, tmp_path
+) -> None:
+    asset_number = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal asset_number
+        if request.url.path.endswith("ThreadService/GetThreadEvents"):
+            attachments = [
+                {
+                    "filename": "../a #.txt",
+                    "mimeType": "text/plain",
+                    "assetUrl": {"url": "https://assets.example/1"},
+                },
+                {
+                    "filename": "a #.txt",
+                    "mimeType": "text/plain",
+                    "assetUrl": {"url": "https://assets.example/2"},
+                },
+                {
+                    "filename": "_index.md",
+                    "mimeType": "text/plain",
+                    "assetUrl": {"url": "https://assets.example/3"},
+                },
+                {
+                    "filename": "",
+                    "mimeType": "image/png\r\n",
+                    "assetUrl": {"url": "https://assets.example/4"},
+                },
+                {
+                    "filename": "dir\\attachment",
+                    "mimeType": "text/plain",
+                    "assetUrl": {"url": "https://assets.example/5"},
+                },
+            ]
+            payload = {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "attachments": attachments,
+                            }
+                        },
+                    }
+                ],
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+            return httpx.Response(200, json=payload, request=request)
+        asset_number += 1
+        return httpx.Response(
+            200, content=f"asset-{asset_number}".encode(), request=request
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert (output / "a #.txt").exists()
+    assert (output / "a #.1.txt").exists()
+    assert (output / "_index.1.md").exists()
+    assert (output / "attachment").exists()
+    assert (output / "attachment.1").exists()
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert "[a \\#.txt](a%20%23.txt)" in content
+    assert "[a \\#.1.txt](a%20%23.1.txt)" in content
+    assert "[_index.1.md](_index.1.md)" not in content
+    assert "_index.1.md" in content
+    assert "../" not in content
+
+
 def test_existing_output_blocks_network_without_force(monkeypatch, tmp_path) -> None:
     output = tmp_path / "bundle"
     output.mkdir()
