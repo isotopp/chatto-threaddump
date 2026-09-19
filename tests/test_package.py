@@ -93,7 +93,7 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
         "Started: 2026-09-19T10:00:00Z\n\n"
         "## Root author\n\n"
         "Root body\n\n"
-        "## reply\n\n"
+        "## @reply\n\n"
         "Reply body\n"
     )
     assert capsys.readouterr().out == ""
@@ -546,6 +546,9 @@ def test_ignores_a_well_formed_non_message_event(monkeypatch, tmp_path) -> None:
                         },
                     },
                 ],
+                "includes": {
+                    "users": {"Uroot": {"id": "Uroot", "displayName": "Root"}}
+                },
                 "page": {"hasOlder": False, "startCursor": ""},
             },
             request=request,
@@ -914,6 +917,179 @@ def test_rejects_page_order_inconsistency(monkeypatch, tmp_path) -> None:
     assert not output.exists()
 
 
+def test_hydrates_missing_authors_in_first_seen_batches_of_100(
+    monkeypatch, tmp_path
+) -> None:
+    batch_requests: list[list[str]] = []
+    root_id = "E12345678901234"
+
+    def event(index: int) -> dict[str, object]:
+        event_id = root_id if index == 0 else f"E{index + 1:014d}"
+        actor_id = f"U{index}"
+        timestamp = f"2026-09-19T10:{index // 60:02d}:{index % 60:02d}Z"
+        message = {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": actor_id,
+            "createdAt": timestamp,
+            "body": f"body {index}",
+        }
+        if index:
+            message["threadRootEventId"] = root_id
+        return {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": actor_id,
+            "createdAt": timestamp,
+            "messagePosted": {"message": message},
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("ThreadService/GetThreadEvents"):
+            payload = {
+                "events": [event(index) for index in range(101)],
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+        else:
+            user_ids = json.loads(request.content)["userIds"]
+            batch_requests.append(user_ids)
+            payload = {
+                "users": [
+                    {
+                        "user": {
+                            "id": user_id,
+                            "displayName": f"Author {user_id[1:]}",
+                        }
+                    }
+                    for user_id in user_ids
+                ]
+            }
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert [len(batch) for batch in batch_requests] == [100, 1]
+    assert batch_requests[0] == [f"U{index}" for index in range(100)]
+    assert batch_requests[1] == ["U100"]
+    assert "Author 100" in (output / "_index.md").read_text(encoding="utf-8")
+
+
+def test_rejects_an_unrequested_batch_user_without_publishing(
+    monkeypatch, tmp_path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("ThreadService/GetThreadEvents"):
+            payload = {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U0",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U0",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "body",
+                            }
+                        },
+                    }
+                ],
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+        else:
+            payload = {"users": [{"user": {"id": "U-other", "displayName": "Other"}}]}
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+
+
+def test_omitted_batch_users_use_unknown_author(monkeypatch, tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("ThreadService/GetThreadEvents"):
+            payload = {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U0",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U0",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "body",
+                            }
+                        },
+                    }
+                ],
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+        else:
+            payload = {"users": []}
+        return httpx.Response(200, json=payload, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert "## Unknown author" in content
+    assert "U0" not in content
+
+
 def test_existing_output_blocks_network_without_force(monkeypatch, tmp_path) -> None:
     output = tmp_path / "bundle"
     output.mkdir()
@@ -967,6 +1143,7 @@ def test_force_replaces_existing_output_after_success(monkeypatch, tmp_path) -> 
                         },
                     }
                 ],
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
                 "page": {"hasOlder": False, "startCursor": ""},
             },
             request=request,

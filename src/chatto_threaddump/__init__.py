@@ -18,6 +18,7 @@ from dotenv import dotenv_values
 
 _THREAD_EVENTS_PATH = "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents"
 _GET_MESSAGE_PATH = "/api/connect/chatto.api.v1.MessageService/GetMessage"
+_BATCH_USERS_PATH = "/api/connect/chatto.api.v1.UserService/BatchGetUsers"
 
 
 class ExportError(Exception):
@@ -166,10 +167,9 @@ def _parse_chatto_url(value: str, server_url: str) -> ChattoLink:
     return ChattoLink(room_id, message_id, thread_root_id)
 
 
-def _render_messages(messages: list[dict[str, object]], includes: object = None) -> str:
-    if includes is None:
-        includes = {}
-    users = includes.get("users", {}) if isinstance(includes, dict) else {}
+def _render_messages(messages: list[dict[str, object]], users: object = None) -> str:
+    if users is None:
+        users = {}
     if not isinstance(users, dict):
         raise ExportError("malformed thread response")
 
@@ -185,7 +185,14 @@ def _render_messages(messages: list[dict[str, object]], includes: object = None)
         user = users.get(actor_id, {})
         if not isinstance(user, dict):
             user = {}
-        author = user.get("displayName") or user.get("login") or "Unknown author"
+        display_name = user.get("displayName")
+        login = user.get("login")
+        if isinstance(display_name, str) and display_name.strip():
+            author = display_name
+        elif isinstance(login, str) and login.strip():
+            author = login if login.startswith("@") else f"@{login}"
+        else:
+            author = "Unknown author"
         body = message.get("body", "")
         if not isinstance(author, str) or not isinstance(body, str):
             raise ExportError("malformed thread response")
@@ -327,12 +334,11 @@ def _request_json(
 
 def _validate_lookup(
     response: dict[str, object], room_id: str, message_id: str
-) -> dict[str, object]:
+) -> tuple[dict[str, object], dict[str, object]]:
     message = _validate_message(response.get("message"))
     if message["id"] != message_id or message["roomId"] != room_id:
         raise ExportError("message lookup did not match the requested message")
-    _validate_includes(response.get("includes"))
-    return message
+    return message, _validate_includes(response.get("includes"))
 
 
 def _load_thread(
@@ -383,6 +389,40 @@ def _load_thread(
     return [root_message, *all_replies], all_users
 
 
+def _hydrate_authors(
+    settings: Settings,
+    messages: list[dict[str, object]],
+    users: dict[str, object],
+) -> dict[str, object]:
+    unresolved: list[str] = []
+    seen: set[str] = set()
+    for message in messages:
+        actor_id = _required_string(message.get("actorId"), "message.actorId")
+        if actor_id not in users and actor_id not in seen:
+            seen.add(actor_id)
+            unresolved.append(actor_id)
+
+    for start in range(0, len(unresolved), 100):
+        batch = unresolved[start : start + 100]
+        response = _request_json(settings, _BATCH_USERS_PATH, {"userIds": batch})
+        records = response.get("users")
+        if not isinstance(records, list):
+            raise ExportError("malformed user response")
+        returned: set[str] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise ExportError("malformed user response")
+            user = record.get("user")
+            if not isinstance(user, dict):
+                raise ExportError("malformed user response")
+            user_id = _required_string(user.get("id"), "user.id")
+            if user_id not in batch or user_id in returned:
+                raise ExportError("invalid user response")
+            returned.add(user_id)
+            users[user_id] = user
+    return users
+
+
 def _check_output_path(output: Path, force: bool) -> None:
     if output.is_symlink() or output.exists():
         if not output.is_dir():
@@ -431,22 +471,28 @@ def _export(url: str, output: Path, settings: Settings) -> None:
     link = _parse_chatto_url(url, settings.server_url)
     if link.thread_root_id is not None:
         messages, includes = _load_thread(settings, link.room_id, link.thread_root_id)
-        content = _render_messages(messages, {"users": includes})
+        content = _render_messages(
+            messages, _hydrate_authors(settings, messages, includes)
+        )
     else:
         lookup = _request_json(
             settings,
             _GET_MESSAGE_PATH,
             {"roomId": link.room_id, "eventId": link.message_id},
         )
-        message = _validate_lookup(lookup, link.room_id, link.message_id)
+        message, includes = _validate_lookup(lookup, link.room_id, link.message_id)
         thread_root_id = message.get("threadRootEventId") or link.message_id
         if not isinstance(thread_root_id, str):
             raise ExportError("malformed Chatto response thread root")
         if "thread" not in message or message.get("thread") is None:
-            content = _render_messages([message], lookup.get("includes", {}))
+            content = _render_messages(
+                [message], _hydrate_authors(settings, [message], includes)
+            )
         else:
             messages, includes = _load_thread(settings, link.room_id, thread_root_id)
-            content = _render_messages(messages, {"users": includes})
+            content = _render_messages(
+                messages, _hydrate_authors(settings, messages, includes)
+            )
     _publish(content, output, settings.force)
 
 
