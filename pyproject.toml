@@ -1,13 +1,16 @@
 [project]
 name = "chatto-threaddump"
 version = "0.1.0"
-description = "Add your description here"
+description = "Export a Chatto thread as Markdown"
 readme = "README.md"
 authors = [
     { name = "Kristian Koehntopp", email = "kris-git@koehntopp.de" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.3",
+]
 
 [project.scripts]
 chatto-threaddump = "chatto_threaddump:main"
@@ -15,3 +18,19 @@ chatto-threaddump = "chatto_threaddump:main"
 [build-system]
 requires = ["uv_build>=0.9.27,<0.10.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+    "ty>=0.0.82",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src", "tests"]
+
+[tool.ty.src]
+include = ["src", "tests"]
