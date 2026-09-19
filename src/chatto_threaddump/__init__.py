@@ -364,10 +364,34 @@ def _request_json(
     try:
         with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
             response = client.post(request_url, headers=headers, json=payload)
-            response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise ExportError("network timeout") from exc
+    except httpx.TransportError as exc:
+        raise ExportError("transport or TLS failure") from exc
+    if response.is_redirect:
+        raise ExportError("redirect rejected")
+    if response.status_code == 401:
+        raise ExportError("authentication failure")
+    if response.status_code == 403:
+        raise ExportError("permission denied")
+    if response.status_code == 404:
+        raise ExportError("Chatto resource not found")
+    if response.status_code >= 500:
+        raise ExportError("Chatto server failure")
+    if response.status_code >= 400:
+        try:
             value = response.json()
-    except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        raise ExportError("Chatto request failed") from exc
+        except json.JSONDecodeError as exc:
+            raise ExportError("malformed JSON response") from exc
+        if isinstance(value, dict) and isinstance(value.get("code"), str):
+            raise ExportError("ConnectRPC failure")
+        raise ExportError("Chatto request failed")
+    try:
+        value = response.json()
+    except json.JSONDecodeError as exc:
+        raise ExportError("malformed JSON response") from exc
+    if isinstance(value, dict) and isinstance(value.get("code"), str):
+        raise ExportError("ConnectRPC failure")
     if not isinstance(value, dict):
         raise ExportError("malformed Chatto response")
     return value
@@ -512,10 +536,21 @@ def _download_asset(settings: Settings, value: object) -> bytes:
             raise ValueError
         with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
             response = client.get(url)
-            response.raise_for_status()
-            return response.content
-    except (ValueError, httpx.HTTPError) as exc:
-        raise ExportError("attachment download failed") from exc
+    except ValueError as exc:
+        raise ExportError("attachment has no usable asset URL") from exc
+    except httpx.TimeoutException as exc:
+        raise ExportError("attachment network timeout") from exc
+    except httpx.TransportError as exc:
+        raise ExportError("attachment transport or TLS failure") from exc
+    if response.is_redirect:
+        raise ExportError("attachment redirect rejected")
+    if response.status_code == 404:
+        raise ExportError("attachment not found")
+    if response.status_code >= 500:
+        raise ExportError("attachment server failure")
+    if response.status_code >= 400:
+        raise ExportError("attachment download failed")
+    return response.content
 
 
 def _collect_attachments(
@@ -643,7 +678,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = _settings(args.timeout, args.force)
         _export(args.chatto_url, args.output_directory, settings)
-    except (ExportError, OSError) as exc:
+    except ExportError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except OSError:
+        print("error: output failure", file=sys.stderr)
         return 1
     return 0

@@ -1632,3 +1632,103 @@ def test_redirected_or_late_failed_asset_preserves_existing_output(
     assert len(asset_requests) == 2
     assert (output / "sentinel.txt").read_text(encoding="utf-8") == "keep"
     assert not (output / "first.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "status, diagnostic",
+    [
+        (401, "authentication failure"),
+        (403, "permission denied"),
+        (404, "resource not found"),
+        (500, "server failure"),
+    ],
+)
+def test_classifies_http_failures_without_private_details(
+    monkeypatch, tmp_path, capsys, status, diagnostic
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=b"private response body", request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(tmp_path / "bundle"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert diagnostic in captured.err
+    assert "private response body" not in captured.err
+    assert "test-key" not in captured.err
+    assert captured.out == ""
+
+
+def test_classifies_connectrpc_and_json_failures(monkeypatch, tmp_path, capsys) -> None:
+    responses = [
+        httpx.Response(
+            400,
+            json={"code": "permission_denied", "message": "private details"},
+        ),
+        httpx.Response(200, content=b"not-json"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = responses.pop(0)
+        response.request = request
+        return response
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    args = [
+        "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+        str(tmp_path / "bundle"),
+    ]
+    assert main(args) == 1
+    captured = capsys.readouterr()
+    assert "ConnectRPC failure" in captured.err
+    assert "private details" not in captured.err
+    assert main(args) == 1
+    captured = capsys.readouterr()
+    assert "malformed JSON response" in captured.err
+
+
+def test_classifies_network_timeouts(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("private timeout details", request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(tmp_path / "bundle"),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "network timeout" in captured.err
+    assert "private timeout details" not in captured.err
