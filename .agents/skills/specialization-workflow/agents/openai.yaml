@@ -1,0 +1,4 @@
+interface:
+  display_name: "Specialization Workflow"
+  short_description: "Plan and commit epics before implementation."
+  default_prompt: "Use the specialization workflow for this epic."

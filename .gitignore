@@ -1,6 +1,22 @@
+# Environment and local configuration
 .env
+.env.*
+!.env.example
 .venv/
+
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test and tool output
 .pytest_cache/
 .ruff_cache/
-*.py[cod]
+.coverage
+htmlcov/
+
+# PyCharm
+.idea/
+*.iml
