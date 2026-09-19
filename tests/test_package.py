@@ -1212,6 +1212,84 @@ def test_normalizes_untrusted_text_without_escaping_message_markdown(
     assert "U1" not in content
 
 
+def test_downloads_and_renders_ordered_attachments_without_api_auth(
+    monkeypatch, tmp_path
+) -> None:
+    asset_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("ThreadService/GetThreadEvents"):
+            payload = {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "attachments": [
+                                    {
+                                        "filename": "photo.png",
+                                        "mimeType": "image/png",
+                                        "description": "A photo",
+                                        "assetUrl": {
+                                            "url": "https://assets.example/photo.png?sig=fake"
+                                        },
+                                    },
+                                    {
+                                        "filename": "doc.pdf",
+                                        "mimeType": "application/pdf",
+                                        "description": "Read me",
+                                        "assetUrl": {
+                                            "url": "https://assets.example/doc.pdf?sig=fake"
+                                        },
+                                    },
+                                ],
+                            }
+                        },
+                    }
+                ],
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                "page": {"hasOlder": False, "startCursor": ""},
+            }
+            return httpx.Response(200, json=payload, request=request)
+        asset_requests.append(request)
+        data = b"PNG" if request.url.path.endswith("photo.png") else b"PDF"
+        return httpx.Response(200, content=data, request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert (output / "photo.png").read_bytes() == b"PNG"
+    assert (output / "doc.pdf").read_bytes() == b"PDF"
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert "![A photo](photo.png)" in content
+    assert "[doc.pdf](doc.pdf) — Read me" in content
+    assert content.index("photo.png") < content.index("doc.pdf")
+    assert len(asset_requests) == 2
+    assert all("Authorization" not in request.headers for request in asset_requests)
+
+
 def test_existing_output_blocks_network_without_force(monkeypatch, tmp_path) -> None:
     output = tmp_path / "bundle"
     output.mkdir()

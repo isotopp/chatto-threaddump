@@ -168,7 +168,11 @@ def _parse_chatto_url(value: str, server_url: str) -> ChattoLink:
     return ChattoLink(room_id, message_id, thread_root_id)
 
 
-def _render_messages(messages: list[dict[str, object]], users: object = None) -> str:
+def _render_messages(
+    messages: list[dict[str, object]],
+    users: object = None,
+    attachments: dict[str, list[str]] | None = None,
+) -> str:
     if users is None:
         users = {}
     if not isinstance(users, dict):
@@ -181,12 +185,17 @@ def _render_messages(messages: list[dict[str, object]], users: object = None) ->
         ("", f"Started: {_escape_metadata(_clean_text(_timestamp(messages[0])))}")
     )
     for message in messages:
+        message_id = _required_string(message.get("id"), "message.id")
         actor_id = _required_string(message.get("actorId"), "message.actorId")
         user = users.get(actor_id, {})
         if not isinstance(user, dict):
             user = {}
         author = _author_label(user)
         rendered.extend(("", f"## {author}", "", _message_body(message)))
+        if attachments is not None:
+            attachment_lines = attachments.get(message_id, [])
+            if attachment_lines:
+                rendered.extend(("", *attachment_lines))
     return "\n".join(rendered) + "\n"
 
 
@@ -455,6 +464,64 @@ def _hydrate_authors(
     return users
 
 
+def _attachment_name(value: object) -> str:
+    if not isinstance(value, str):
+        return "attachment"
+    name = Path(_clean_text(value)).name
+    return name if name not in ("", ".", "..") else "attachment"
+
+
+def _download_asset(settings: Settings, value: object) -> bytes:
+    if not isinstance(value, dict) or not isinstance(value.get("url"), str):
+        raise ExportError("attachment has no usable asset URL")
+    url = value["url"]
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "https" or not parsed.netloc:
+            raise ValueError
+        with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            return response.content
+    except (ValueError, httpx.HTTPError) as exc:
+        raise ExportError("attachment download failed") from exc
+
+
+def _collect_attachments(
+    settings: Settings, messages: list[dict[str, object]]
+) -> tuple[dict[str, list[str]], list[tuple[str, bytes]]]:
+    links: dict[str, list[str]] = {}
+    files: list[tuple[str, bytes]] = []
+    for message in messages:
+        message_id = _required_string(message.get("id"), "message.id")
+        raw_attachments = message.get("attachments", [])
+        if not isinstance(raw_attachments, list):
+            raise ExportError("malformed message attachments")
+        for attachment in raw_attachments:
+            if not isinstance(attachment, dict):
+                raise ExportError("malformed attachment")
+            filename = _attachment_name(attachment.get("filename"))
+            mime_type = attachment.get("mimeType", "application/octet-stream")
+            if not isinstance(mime_type, str):
+                raise ExportError("malformed attachment MIME type")
+            description = attachment.get("description", "")
+            if description is None:
+                description = ""
+            if not isinstance(description, str):
+                raise ExportError("malformed attachment description")
+            data = _download_asset(settings, attachment.get("assetUrl"))
+            label = _clean_text(description) or filename
+            if mime_type.lower().startswith("image/"):
+                link = f"![{_escape_metadata(label)}]({filename})"
+            else:
+                link = f"[{_escape_metadata(filename)}]({filename})"
+                if description:
+                    link += f" — {_escape_metadata(_clean_text(description))}"
+            links.setdefault(message_id, []).append(link)
+            files.append((filename, data))
+    return links, files
+
+
 def _check_output_path(output: Path, force: bool) -> None:
     if output.is_symlink() or output.exists():
         if not output.is_dir():
@@ -463,7 +530,12 @@ def _check_output_path(output: Path, force: bool) -> None:
             raise ExportError("output directory already exists; use --force")
 
 
-def _publish(content: str, output: Path, force: bool) -> None:
+def _publish(
+    content: str,
+    output: Path,
+    force: bool,
+    files: list[tuple[str, bytes]],
+) -> None:
     existing_parent = output.parent
     while not existing_parent.exists():
         existing_parent = existing_parent.parent
@@ -474,6 +546,8 @@ def _publish(content: str, output: Path, force: bool) -> None:
     backup: Path | None = None
     try:
         (staged / "_index.md").write_text(content, encoding="utf-8")
+        for filename, data in files:
+            (staged / filename).write_bytes(data)
         output.parent.mkdir(parents=True, exist_ok=True)
         if force and (output.is_symlink() or output.exists()):
             backup = Path(
@@ -503,9 +577,6 @@ def _export(url: str, output: Path, settings: Settings) -> None:
     link = _parse_chatto_url(url, settings.server_url)
     if link.thread_root_id is not None:
         messages, includes = _load_thread(settings, link.room_id, link.thread_root_id)
-        content = _render_messages(
-            messages, _hydrate_authors(settings, messages, includes)
-        )
     else:
         lookup = _request_json(
             settings,
@@ -517,15 +588,13 @@ def _export(url: str, output: Path, settings: Settings) -> None:
         if not isinstance(thread_root_id, str):
             raise ExportError("malformed Chatto response thread root")
         if "thread" not in message or message.get("thread") is None:
-            content = _render_messages(
-                [message], _hydrate_authors(settings, [message], includes)
-            )
+            messages = [message]
         else:
             messages, includes = _load_thread(settings, link.room_id, thread_root_id)
-            content = _render_messages(
-                messages, _hydrate_authors(settings, messages, includes)
-            )
-    _publish(content, output, settings.force)
+    users = _hydrate_authors(settings, messages, includes)
+    attachment_links, files = _collect_attachments(settings, messages)
+    content = _render_messages(messages, users, attachment_links)
+    _publish(content, output, settings.force, files)
 
 
 def main(argv: list[str] | None = None) -> int:
