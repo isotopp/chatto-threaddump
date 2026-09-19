@@ -22,6 +22,9 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
                 "events": [
                     {
                         "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T10:00:00Z",
                         "messagePosted": {
                             "message": {
                                 "id": "E12345678901234",
@@ -34,11 +37,15 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
                     },
                     {
                         "id": "E22345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Ureply",
+                        "createdAt": "2026-09-19T10:01:00Z",
                         "messagePosted": {
                             "message": {
                                 "id": "E22345678901234",
                                 "roomId": "R12345678901234",
                                 "actorId": "Ureply",
+                                "threadRootEventId": "E12345678901234",
                                 "createdAt": "2026-09-19T10:01:00Z",
                                 "body": "Reply body",
                             }
@@ -51,6 +58,7 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
                         "Ureply": {"id": "Ureply", "login": "reply"},
                     }
                 },
+                "page": {"hasOlder": False, "startCursor": ""},
             },
             request=request,
         )
@@ -115,16 +123,23 @@ def test_process_environment_overrides_dotenv_and_timeout_is_configurable(
             json={
                 "events": [
                     {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
                         "messagePosted": {
                             "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
                                 "actorId": "U",
                                 "createdAt": "2026-09-19T10:00:00Z",
                                 "body": "body",
                             }
-                        }
+                        },
                     }
                 ],
-                "includes": {"users": {"U": {"displayName": "Author"}}},
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                "page": {"hasOlder": False, "startCursor": ""},
             },
             request=request,
         )
@@ -177,16 +192,23 @@ def test_dotenv_supplies_missing_process_configuration(monkeypatch, tmp_path) ->
             json={
                 "events": [
                     {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
                         "messagePosted": {
                             "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
                                 "actorId": "U",
                                 "createdAt": "2026-09-19T10:00:00Z",
                                 "body": "body",
                             }
-                        }
+                        },
                     }
                 ],
-                "includes": {"users": {"U": {"displayName": "Author"}}},
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                "page": {"hasOlder": False, "startCursor": ""},
             },
             request=request,
         )
@@ -284,7 +306,7 @@ def test_resolves_an_unthreaded_room_message(monkeypatch, tmp_path) -> None:
                     "createdAt": "2026-09-19T10:00:00Z",
                     "body": "Standalone body",
                 },
-                "includes": {"users": {"U": {"displayName": "Author"}}},
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
             },
             request=request,
         )
@@ -338,6 +360,10 @@ def test_resolves_a_room_reply_through_its_thread(monkeypatch, tmp_path) -> None
             payload = {
                 "events": [
                     {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T10:00:00Z",
                         "messagePosted": {
                             "message": {
                                 "id": "E12345678901234",
@@ -346,26 +372,32 @@ def test_resolves_a_room_reply_through_its_thread(monkeypatch, tmp_path) -> None
                                 "createdAt": "2026-09-19T10:00:00Z",
                                 "body": "Root body",
                             }
-                        }
+                        },
                     },
                     {
+                        "id": "E22345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Ureply",
+                        "createdAt": "2026-09-19T10:01:00Z",
                         "messagePosted": {
                             "message": {
                                 "id": "E22345678901234",
                                 "roomId": "R12345678901234",
                                 "actorId": "Ureply",
+                                "threadRootEventId": "E12345678901234",
                                 "createdAt": "2026-09-19T10:01:00Z",
                                 "body": "Reply body",
                             }
-                        }
+                        },
                     },
                 ],
                 "includes": {
                     "users": {
-                        "Uroot": {"displayName": "Root"},
-                        "Ureply": {"displayName": "Reply"},
+                        "Uroot": {"id": "Uroot", "displayName": "Root"},
+                        "Ureply": {"id": "Ureply", "displayName": "Reply"},
                     }
                 },
+                "page": {"hasOlder": False, "startCursor": ""},
             }
         return httpx.Response(200, json=payload, request=request)
 
@@ -433,3 +465,108 @@ def test_rejects_a_room_lookup_that_returns_another_message(
         == 1
     )
     assert not output.exists()
+
+
+def test_rejects_inconsistent_message_event_without_publishing(
+    monkeypatch, tmp_path
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Ureply",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "body",
+                            }
+                        },
+                    }
+                ],
+                "page": {"hasOlder": False, "startCursor": ""},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+
+
+def test_ignores_a_well_formed_non_message_event(monkeypatch, tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "events": [
+                    {
+                        "id": "E32345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T09:59:00Z",
+                        "reactionAdded": {},
+                    },
+                    {
+                        "id": "E12345678901234",
+                        "roomId": "R12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Uroot",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "body",
+                            }
+                        },
+                    },
+                ],
+                "page": {"hasOlder": False, "startCursor": ""},
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert (output / "_index.md").exists()

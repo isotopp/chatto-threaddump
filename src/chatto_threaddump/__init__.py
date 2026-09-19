@@ -182,22 +182,99 @@ def _render_messages(messages: list[dict[str, object]], includes: object = None)
     return "\n".join(rendered) + "\n"
 
 
-def _render_page(page: dict[str, object]) -> str:
-    events = page.get("events")
-    if not isinstance(events, list):
+def _required_string(value: object, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ExportError(f"malformed Chatto response field: {field}")
+    return value
+
+
+def _timestamp(value: dict[str, object]) -> str:
+    for field in ("createdAt", "createTime"):
+        if field in value:
+            return _required_string(value[field], field)
+    raise ExportError("malformed Chatto response field: creation timestamp")
+
+
+def _validate_includes(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ExportError("malformed Chatto response includes")
+    users = value.get("users", {})
+    if not isinstance(users, dict):
+        raise ExportError("malformed Chatto response users")
+    for user_id, user in users.items():
+        if not isinstance(user_id, str) or not isinstance(user, dict):
+            raise ExportError("malformed Chatto response user map")
+        if user.get("id") != user_id:
+            raise ExportError("malformed Chatto response user identity")
+    return users
+
+
+def _validate_message(message: object) -> dict[str, object]:
+    if not isinstance(message, dict):
+        raise ExportError("malformed Chatto response message")
+    _required_string(message.get("id"), "message.id")
+    _required_string(message.get("roomId"), "message.roomId")
+    _required_string(message.get("actorId"), "message.actorId")
+    _timestamp(message)
+    if "threadRootEventId" in message and not isinstance(
+        message["threadRootEventId"], str
+    ):
+        raise ExportError("malformed Chatto response thread root")
+    if "thread" in message and not isinstance(message["thread"], dict):
+        raise ExportError("malformed Chatto response thread summary")
+    return message
+
+
+def _validate_thread_page(
+    response: dict[str, object], room_id: str, root_id: str, *, initial: bool
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    events = response.get("events")
+    page = response.get("page")
+    if not isinstance(events, list) or not isinstance(page, dict):
         raise ExportError("malformed thread response")
+    if not isinstance(page.get("hasOlder"), bool):
+        raise ExportError("malformed thread response page")
+    if "startCursor" in page and not isinstance(page["startCursor"], str):
+        raise ExportError("malformed thread response cursor")
+    includes = _validate_includes(response.get("includes"))
     messages: list[dict[str, object]] = []
     for event in events:
         if not isinstance(event, dict):
-            raise ExportError("malformed thread response")
+            raise ExportError("malformed thread event")
+        event_id = _required_string(event.get("id"), "event.id")
+        event_room = _required_string(event.get("roomId"), "event.roomId")
+        event_actor = _required_string(event.get("actorId"), "event.actorId")
+        event_timestamp = _timestamp(event)
+        if event_room != room_id:
+            raise ExportError("malformed thread event room")
         posted = event.get("messagePosted")
-        if not isinstance(posted, dict):
+        if posted is None:
             continue
-        message = posted.get("message")
-        if not isinstance(message, dict):
-            raise ExportError("malformed thread response")
+        if not isinstance(posted, dict):
+            raise ExportError("malformed message-posted event")
+        message = _validate_message(posted.get("message"))
+        if (
+            message["id"] != event_id
+            or message["roomId"] != event_room
+            or message["actorId"] != event_actor
+            or _timestamp(message) != event_timestamp
+        ):
+            raise ExportError("inconsistent message event")
+        if message["id"] != root_id and message.get("threadRootEventId") != root_id:
+            raise ExportError("inconsistent reply thread root")
         messages.append(message)
-    return _render_messages(messages, page.get("includes", {}))
+
+    root_positions = [
+        index for index, message in enumerate(messages) if message["id"] == root_id
+    ]
+    if initial:
+        if root_positions != [0]:
+            raise ExportError("thread root is missing or misplaced")
+    elif root_positions:
+        raise ExportError("older thread page contains the root")
+    return messages, includes
 
 
 def _request_json(
@@ -221,6 +298,16 @@ def _request_json(
     return value
 
 
+def _validate_lookup(
+    response: dict[str, object], room_id: str, message_id: str
+) -> dict[str, object]:
+    message = _validate_message(response.get("message"))
+    if message["id"] != message_id or message["roomId"] != room_id:
+        raise ExportError("message lookup did not match the requested message")
+    _validate_includes(response.get("includes"))
+    return message
+
+
 def _export(url: str, output: Path, settings: Settings) -> None:
     link = _parse_chatto_url(url, settings.server_url)
     if link.thread_root_id is not None:
@@ -233,21 +320,20 @@ def _export(url: str, output: Path, settings: Settings) -> None:
                 "limit": 500,
             },
         )
-        content = _render_page(page)
+        messages, includes = _validate_thread_page(
+            page, link.room_id, link.thread_root_id, initial=True
+        )
+        content = _render_messages(messages, {"users": includes})
     else:
         lookup = _request_json(
             settings,
             _GET_MESSAGE_PATH,
             {"roomId": link.room_id, "eventId": link.message_id},
         )
-        message = lookup.get("message")
-        if (
-            not isinstance(message, dict)
-            or message.get("id") != link.message_id
-            or message.get("roomId") != link.room_id
-        ):
-            raise ExportError("message lookup did not match the requested message")
+        message = _validate_lookup(lookup, link.room_id, link.message_id)
         thread_root_id = message.get("threadRootEventId") or link.message_id
+        if not isinstance(thread_root_id, str):
+            raise ExportError("malformed Chatto response thread root")
         if "thread" not in message or message.get("thread") is None:
             content = _render_messages([message], lookup.get("includes", {}))
         else:
@@ -260,7 +346,10 @@ def _export(url: str, output: Path, settings: Settings) -> None:
                     "limit": 500,
                 },
             )
-            content = _render_page(page)
+            messages, includes = _validate_thread_page(
+                page, link.room_id, thread_root_id, initial=True
+            )
+            content = _render_messages(messages, {"users": includes})
     output.mkdir(parents=True, exist_ok=False)
     (output / "_index.md").write_text(content, encoding="utf-8")
 
