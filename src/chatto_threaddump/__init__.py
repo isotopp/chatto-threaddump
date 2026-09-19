@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 import httpx
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 
 _THREAD_EVENTS_PATH = "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents"
 _GET_MESSAGE_PATH = "/api/connect/chatto.api.v1.MessageService/GetMessage"
@@ -70,25 +70,15 @@ def _timeout(value: str) -> float:
 
 
 def _settings(timeout: float, force: bool) -> Settings:
-    values = {
-        "CHATTO_THREADDUMP_SERVER_URL": os.environ.get("CHATTO_THREADDUMP_SERVER_URL"),
-        "CHATTO_THREADDUMP_API_KEY": os.environ.get("CHATTO_THREADDUMP_API_KEY"),
-    }
-    env_path = Path.cwd() / ".env"
-    if not env_path.exists():
-        env_path = Path.home() / ".chatto-threaddump.env"
-    if env_path.is_file():
-        for key, value in dotenv_values(env_path).items():
-            if key in values and values[key] is None and isinstance(value, str):
-                values[key] = value
-    if (
-        not values["CHATTO_THREADDUMP_SERVER_URL"]
-        or not values["CHATTO_THREADDUMP_API_KEY"]
-    ):
+    if not load_dotenv(".env"):
+        load_dotenv(Path.home() / ".chatto-threaddump.env")
+    server_url = os.environ.get("CHATTO_THREADDUMP_SERVER_URL")
+    api_key = os.environ.get("CHATTO_THREADDUMP_API_KEY")
+    if not server_url or not api_key:
         raise ExportError("missing Chatto configuration")
     return Settings(
-        server_url=values["CHATTO_THREADDUMP_SERVER_URL"],
-        api_key=values["CHATTO_THREADDUMP_API_KEY"],
+        server_url=server_url,
+        api_key=api_key,
         timeout=timeout,
         force=force,
     )
