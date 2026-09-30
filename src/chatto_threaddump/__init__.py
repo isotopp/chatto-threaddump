@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import re
@@ -9,17 +8,25 @@ import shutil
 import sys
 import tempfile
 import unicodedata
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import SplitResult, quote, urlsplit
 
 import httpx
+from chattolib._connect import Code, ConnectError
+from chattolib._pb.chatto.api.v1 import (
+    messages_pb2,
+    room_timeline_pb2,
+    user_service_pb2,
+)
+from chattolib._pb.chatto.api.v1.messages_connect import MessageServiceClientSync
+from chattolib._pb.chatto.api.v1.threads_connect import ThreadServiceClientSync
+from chattolib._pb.chatto.api.v1.user_service_connect import UserServiceClientSync
 from dotenv import load_dotenv
-
-_THREAD_EVENTS_PATH = "/api/connect/chatto.api.v1.ThreadService/GetThreadEvents"
-_GET_MESSAGE_PATH = "/api/connect/chatto.api.v1.MessageService/GetMessage"
-_BATCH_USERS_PATH = "/api/connect/chatto.api.v1.UserService/BatchGetUsers"
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import DecodeError, Message
 
 
 class ExportError(Exception):
@@ -287,40 +294,23 @@ def _validate_message(message: object) -> dict[str, object]:
     return message
 
 
-def _normalize_thread_page(
-    response: dict[str, object], room_id: str
-) -> dict[str, object]:
-    if "events" in response:
-        return response
-    page = response.get("page")
-    if not isinstance(page, dict):
-        raise ExportError("malformed thread response")
-    events = page.get("events", [])
-    if not isinstance(events, list):
-        raise ExportError("malformed thread response")
-    normalized_events = [
-        {**event, "roomId": room_id}
-        if isinstance(event, dict) and "roomId" not in event
-        else event
-        for event in events
-    ]
-    has_older = page.get("hasOlder", len(events) >= 500)
-    return {
-        "events": normalized_events,
-        "includes": page.get("includes", {}),
-        "page": {
-            "hasOlder": has_older,
-            "startCursor": page.get("startCursor", ""),
-        },
-    }
+def _response_dict(response: Message) -> dict[str, object]:
+    try:
+        return MessageToDict(response, always_print_fields_with_no_presence=True)
+    except ValueError as exc:
+        raise ExportError("malformed Chatto response") from exc
+
+
+def _headers(settings: Settings) -> dict[str, str]:
+    return {"Authorization": f"Bearer {settings.api_key}"}
 
 
 def _validate_thread_page(
     response: dict[str, object], room_id: str, root_id: str, *, initial: bool
 ) -> ValidatedPage:
     events = response.get("events")
-    page = response.get("page")
-    if not isinstance(events, list) or not isinstance(page, dict):
+    page = response
+    if not isinstance(events, list):
         raise ExportError("malformed thread response")
     if not isinstance(page.get("hasOlder"), bool):
         raise ExportError("malformed thread response page")
@@ -334,15 +324,12 @@ def _validate_thread_page(
         if not isinstance(event, dict):
             raise ExportError("malformed thread event")
         event_id = _required_string(event.get("id"), "event.id")
-        event_room = _required_string(event.get("roomId"), "event.roomId")
         event_actor = _required_string(event.get("actorId"), "event.actorId")
         event_timestamp = _timestamp(event)
         event_ids.append(event_id)
         event_times.append(_timestamp_value(event_timestamp))
         if len(event_times) > 1 and event_times[-2] > event_times[-1]:
             raise ExportError("thread events are out of order")
-        if event_room != room_id:
-            raise ExportError("malformed thread event room")
         posted = event.get("messagePosted")
         if posted is None:
             continue
@@ -351,7 +338,7 @@ def _validate_thread_page(
         message = _validate_message(posted.get("message"))
         if (
             message["id"] != event_id
-            or message["roomId"] != event_room
+            or message["roomId"] != room_id
             or message["actorId"] != event_actor
             or _timestamp(message) != event_timestamp
         ):
@@ -371,51 +358,6 @@ def _validate_thread_page(
     return ValidatedPage(messages, includes, tuple(event_ids), tuple(event_times))
 
 
-def _request_json(
-    settings: Settings, path: str, payload: dict[str, object]
-) -> dict[str, object]:
-    headers = {
-        "Authorization": f"Bearer {settings.api_key}",
-        "Content-Type": "application/json",
-        "Connect-Protocol-Version": "1",
-    }
-    request_url = settings.server_url.rstrip("/") + path
-    try:
-        with httpx.Client(follow_redirects=False, timeout=settings.timeout) as client:
-            response = client.post(request_url, headers=headers, json=payload)
-    except httpx.TimeoutException as exc:
-        raise ExportError("network timeout") from exc
-    except httpx.TransportError as exc:
-        raise ExportError("transport or TLS failure") from exc
-    if response.is_redirect:
-        raise ExportError("redirect rejected")
-    if response.status_code == 401:
-        raise ExportError("authentication failure")
-    if response.status_code == 403:
-        raise ExportError("permission denied")
-    if response.status_code == 404:
-        raise ExportError("Chatto resource not found")
-    if response.status_code >= 500:
-        raise ExportError("Chatto server failure")
-    if response.status_code >= 400:
-        try:
-            value = response.json()
-        except json.JSONDecodeError as exc:
-            raise ExportError("malformed JSON response") from exc
-        if isinstance(value, dict) and isinstance(value.get("code"), str):
-            raise ExportError("ConnectRPC failure")
-        raise ExportError("Chatto request failed")
-    try:
-        value = response.json()
-    except json.JSONDecodeError as exc:
-        raise ExportError("malformed JSON response") from exc
-    if isinstance(value, dict) and isinstance(value.get("code"), str):
-        raise ExportError("ConnectRPC failure")
-    if not isinstance(value, dict):
-        raise ExportError("malformed Chatto response")
-    return value
-
-
 def _validate_lookup(
     response: dict[str, object], room_id: str, message_id: str
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -426,15 +368,15 @@ def _validate_lookup(
 
 
 def _load_thread(
-    settings: Settings, room_id: str, root_id: str
+    settings: Settings, client: ThreadServiceClientSync, room_id: str, root_id: str
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
-    page = _normalize_thread_page(
-        _request_json(
-            settings,
-            _THREAD_EVENTS_PATH,
-            {"roomId": room_id, "threadRootEventId": root_id, "limit": 500},
-        ),
-        room_id,
+    page = _response_dict(
+        client.get_thread_events(
+            room_timeline_pb2.GetThreadEventsRequest(  # ty: ignore[unresolved-attribute]
+                room_id=room_id, thread_root_event_id=root_id, limit=500
+            ),
+            headers=_headers(settings),
+        ).page
     )
     first_page = _validate_thread_page(page, room_id, root_id, initial=True)
     root_message, all_replies = first_page.messages[0], first_page.messages[1:]
@@ -442,24 +384,21 @@ def _load_thread(
     seen_event_ids = set(first_page.event_ids)
     root_time = _timestamp_value(_timestamp(root_message))
     seen_cursors: set[str] = set()
-    page_info = page["page"]
-    while isinstance(page_info, dict) and page_info["hasOlder"]:
-        cursor = page_info.get("startCursor")
+    while page["hasOlder"]:
+        cursor = page.get("startCursor")
         if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
             raise ExportError("invalid thread pagination cursor")
         seen_cursors.add(cursor)
-        page = _normalize_thread_page(
-            _request_json(
-                settings,
-                _THREAD_EVENTS_PATH,
-                {
-                    "roomId": room_id,
-                    "threadRootEventId": root_id,
-                    "limit": 500,
-                    "before": cursor,
-                },
-            ),
-            room_id,
+        page = _response_dict(
+            client.get_thread_events(
+                room_timeline_pb2.GetThreadEventsRequest(  # ty: ignore[unresolved-attribute]
+                    room_id=room_id,
+                    thread_root_event_id=root_id,
+                    limit=500,
+                    before=cursor,
+                ),
+                headers=_headers(settings),
+            ).page
         )
         older_page = _validate_thread_page(page, room_id, root_id, initial=False)
         if any(event_id in seen_event_ids for event_id in older_page.event_ids):
@@ -475,12 +414,12 @@ def _load_thread(
                 raise ExportError("reply precedes thread root")
         all_replies = older_messages + all_replies
         all_users.update(older_users)
-        page_info = page["page"]
     return [root_message, *all_replies], all_users
 
 
 def _hydrate_authors(
     settings: Settings,
+    client: UserServiceClientSync,
     messages: list[dict[str, object]],
     users: dict[str, object],
 ) -> dict[str, object]:
@@ -494,7 +433,12 @@ def _hydrate_authors(
 
     for start in range(0, len(unresolved), 100):
         batch = unresolved[start : start + 100]
-        response = _request_json(settings, _BATCH_USERS_PATH, {"userIds": batch})
+        response = _response_dict(
+            client.batch_get_users(
+                user_service_pb2.BatchGetUsersRequest(user_ids=batch),  # ty: ignore[unresolved-attribute]
+                headers=_headers(settings),
+            )
+        )
         records = response.get("users")
         if not isinstance(records, list):
             raise ExportError("malformed user response")
@@ -586,7 +530,7 @@ def _collect_attachments(
                 _attachment_name(attachment.get("filename")), used_names
             )
             mime_type = _mime_type(
-                attachment.get("mimeType", "application/octet-stream")
+                attachment.get("contentType", "application/octet-stream")
             )
             description = attachment.get("description", "")
             if description is None:
@@ -661,23 +605,39 @@ def _publish(
 def _export(url: str, output: Path, settings: Settings) -> None:
     _check_output_path(output, settings.force)
     link = _parse_chatto_url(url, settings.server_url)
-    if link.thread_root_id is not None:
-        messages, includes = _load_thread(settings, link.room_id, link.thread_root_id)
-    else:
-        lookup = _request_json(
-            settings,
-            _GET_MESSAGE_PATH,
-            {"roomId": link.room_id, "eventId": link.message_id},
-        )
-        message, includes = _validate_lookup(lookup, link.room_id, link.message_id)
-        thread_root_id = message.get("threadRootEventId") or link.message_id
-        if not isinstance(thread_root_id, str):
-            raise ExportError("malformed Chatto response thread root")
-        if "thread" not in message or message.get("thread") is None:
-            messages = [message]
+    address = settings.server_url.rstrip("/") + "/api/connect"
+    timeout_ms = max(1, math.ceil(settings.timeout * 1000))
+    with ExitStack() as stack:
+        thread_client = ThreadServiceClientSync(address, timeout_ms=timeout_ms)
+        stack.callback(thread_client.close)
+        message_client = MessageServiceClientSync(address, timeout_ms=timeout_ms)
+        stack.callback(message_client.close)
+        user_client = UserServiceClientSync(address, timeout_ms=timeout_ms)
+        stack.callback(user_client.close)
+        if link.thread_root_id is not None:
+            messages, includes = _load_thread(
+                settings, thread_client, link.room_id, link.thread_root_id
+            )
         else:
-            messages, includes = _load_thread(settings, link.room_id, thread_root_id)
-    users = _hydrate_authors(settings, messages, includes)
+            lookup = _response_dict(
+                message_client.get_message(
+                    messages_pb2.GetMessageRequest(  # ty: ignore[unresolved-attribute]
+                        room_id=link.room_id, event_id=link.message_id
+                    ),
+                    headers=_headers(settings),
+                )
+            )
+            message, includes = _validate_lookup(lookup, link.room_id, link.message_id)
+            thread_root_id = message.get("threadRootEventId") or link.message_id
+            if not isinstance(thread_root_id, str):
+                raise ExportError("malformed Chatto response thread root")
+            if thread_root_id == link.message_id and "thread" not in message:
+                messages = [message]
+            else:
+                messages, includes = _load_thread(
+                    settings, thread_client, link.room_id, thread_root_id
+                )
+        users = _hydrate_authors(settings, user_client, messages, includes)
     attachment_links, files = _collect_attachments(settings, messages)
     content = _render_messages(messages, users, attachment_links)
     _publish(content, output, settings.force, files)
@@ -710,6 +670,24 @@ def main(argv: list[str] | None = None) -> int:
         _export(args.chatto_url, args.output_directory, settings)
     except ExportError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except ConnectError as exc:
+        diagnostic = {
+            Code.UNAUTHENTICATED: "authentication failure",
+            Code.PERMISSION_DENIED: "permission denied",
+            Code.NOT_FOUND: "Chatto resource not found",
+            Code.DEADLINE_EXCEEDED: "network timeout",
+            Code.UNAVAILABLE: "transport or TLS failure",
+            Code.INTERNAL: "Chatto server failure",
+        }.get(exc.code, "ConnectRPC failure")
+        if exc.status_code is not None and 300 <= exc.status_code < 400:
+            diagnostic = "redirect rejected"
+        elif exc.status_code is not None and exc.status_code >= 500:
+            diagnostic = "Chatto server failure"
+        print(f"error: {diagnostic}", file=sys.stderr)
+        return 1
+    except DecodeError:
+        print("error: malformed protobuf response", file=sys.stderr)
         return 1
     except OSError:
         print("error: output failure", file=sys.stderr)

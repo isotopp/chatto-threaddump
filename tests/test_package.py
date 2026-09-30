@@ -1,9 +1,62 @@
-import json
-
 import httpx
 import pytest
+from chattolib._pb.chatto.api.v1 import (
+    messages_pb2,
+    room_timeline_pb2,
+    user_service_pb2,
+)
+from google.protobuf.json_format import MessageToDict, ParseDict
 
 from chatto_threaddump import main
+
+_REQUEST_TYPES = {
+    "GetMessage": messages_pb2.GetMessageRequest,  # ty: ignore[unresolved-attribute]
+    "GetThreadEvents": room_timeline_pb2.GetThreadEventsRequest,  # ty: ignore[unresolved-attribute]
+    "BatchGetUsers": user_service_pb2.BatchGetUsersRequest,  # ty: ignore[unresolved-attribute]
+}
+_RESPONSE_TYPES = {
+    "GetMessage": messages_pb2.GetMessageResponse,  # ty: ignore[unresolved-attribute]
+    "GetThreadEvents": room_timeline_pb2.GetThreadEventsResponse,  # ty: ignore[unresolved-attribute]
+    "BatchGetUsers": user_service_pb2.BatchGetUsersResponse,  # ty: ignore[unresolved-attribute]
+}
+
+
+def _request_payload(request: httpx.Request):
+    method = request.url.path.rsplit("/", 1)[-1]
+    return MessageToDict(_REQUEST_TYPES[method].FromString(request.content))
+
+
+def _install_transport(monkeypatch, handler, client_options=None):
+    def respond(request: httpx.Request) -> httpx.Response:
+        response = handler(request)
+        if (
+            request.method == "POST"
+            and response.status_code == 200
+            and response.headers.get("content-type") == "application/json"
+        ):
+            method = request.url.path.rsplit("/", 1)[-1]
+            message = ParseDict(response.json(), _RESPONSE_TYPES[method]())
+            return httpx.Response(
+                200,
+                content=message.SerializeToString(),
+                headers={"content-type": "application/proto"},
+                request=request,
+            )
+        return response
+
+    transport = httpx.MockTransport(respond)
+    real_sync = httpx.Client
+    real_async = httpx.AsyncClient
+
+    def async_client(**kwargs):
+        if client_options is not None:
+            client_options.update(kwargs)
+        return real_async(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", async_client)
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kwargs: real_sync(transport=transport, **kwargs)
+    )
 
 
 def test_console_entry_point_exists() -> None:
@@ -30,63 +83,55 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Uroot",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Uroot",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "Root body",
-                            }
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Uroot",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "Root body",
+                                }
+                            },
                         },
-                    },
-                    {
-                        "id": "E22345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Ureply",
-                        "createdAt": "2026-09-19T10:01:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E22345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Ureply",
-                                "threadRootEventId": "E12345678901234",
-                                "createdAt": "2026-09-19T10:01:00Z",
-                                "body": "Reply body",
-                            }
+                        {
+                            "id": "E22345678901234",
+                            "actorId": "Ureply",
+                            "createdAt": "2026-09-19T10:01:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E22345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Ureply",
+                                    "threadRootEventId": "E12345678901234",
+                                    "createdAt": "2026-09-19T10:01:00Z",
+                                    "body": "Reply body",
+                                }
+                            },
                         },
+                    ],
+                    "includes": {
+                        "users": {
+                            "Uroot": {"id": "Uroot", "displayName": "Root author"},
+                            "Ureply": {"id": "Ureply", "login": "reply"},
+                        }
                     },
-                ],
-                "includes": {
-                    "users": {
-                        "Uroot": {"id": "Uroot", "displayName": "Root author"},
-                        "Ureply": {"id": "Ureply", "login": "reply"},
-                    }
-                },
-                "page": {"hasOlder": False, "startCursor": ""},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
 
-    def client(**kwargs):
-        client_options.update(kwargs)
-        return real_client(transport=httpx.MockTransport(handler), **kwargs)
-
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        client,
-    )
+    _install_transport(monkeypatch, handler, client_options)
 
     output = tmp_path / "nested" / "bundle"
     assert (
@@ -114,12 +159,16 @@ def test_exports_an_explicit_thread_page(monkeypatch, tmp_path, capsys) -> None:
         "chatto.api.v1.ThreadService/GetThreadEvents"
     )
     assert requests[0].headers["Authorization"] == "Bearer test-key"
-    assert json.loads(requests[0].content) == {
+    assert requests[0].headers["Content-Type"] == "application/proto"
+    assert requests[0].extensions["timeout"]["read"] == 5.0
+    assert _request_payload(requests[0]) == {
         "roomId": "R12345678901234",
         "threadRootEventId": "E12345678901234",
         "limit": 500,
     }
-    assert client_options["timeout"] == 5.0
+    timeout = client_options["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 5.0
 
 
 def test_process_environment_overrides_dotenv_and_timeout_is_configurable(
@@ -132,25 +181,27 @@ def test_process_environment_overrides_dotenv_and_timeout_is_configurable(
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "body",
-                            }
-                        },
-                    }
-                ],
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
@@ -163,12 +214,7 @@ def test_process_environment_overrides_dotenv_and_timeout_is_configurable(
     )
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "process-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
 
     assert (
         main(
@@ -183,6 +229,7 @@ def test_process_environment_overrides_dotenv_and_timeout_is_configurable(
         == 0
     )
     assert requests[0].headers["Authorization"] == "Bearer process-key"
+    assert requests[0].extensions["timeout"]["read"] == 1.25
 
 
 def test_dotenv_supplies_missing_process_configuration(monkeypatch, tmp_path) -> None:
@@ -195,40 +242,36 @@ def test_dotenv_supplies_missing_process_configuration(monkeypatch, tmp_path) ->
     monkeypatch.delenv("CHATTO_THREADDUMP_SERVER_URL", raising=False)
     monkeypatch.delenv("CHATTO_THREADDUMP_API_KEY", raising=False)
 
-    real_client = httpx.Client
-
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "body",
-                            }
-                        },
-                    }
-                ],
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     assert (
         main(
             [
@@ -297,6 +340,7 @@ def test_rejects_untrusted_origins_and_malformed_links(
         raise AssertionError("invalid input must not create an HTTP client")
 
     monkeypatch.setattr(httpx, "Client", client)
+    monkeypatch.setattr(httpx, "AsyncClient", client)
     assert main([chatto_url, str(tmp_path / "bundle")]) == 1
     assert calls == 0
     assert "test-key" not in capsys.readouterr().err
@@ -307,6 +351,12 @@ def test_resolves_an_unthreaded_room_message(monkeypatch, tmp_path) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        if request.url.path.endswith("UserService/BatchGetUsers"):
+            return httpx.Response(
+                200,
+                json={"users": [{"user": {"id": "U", "displayName": "Author"}}]},
+                request=request,
+            )
         return httpx.Response(
             200,
             json={
@@ -317,19 +367,13 @@ def test_resolves_an_unthreaded_room_message(monkeypatch, tmp_path) -> None:
                     "createdAt": "2026-09-19T10:00:00Z",
                     "body": "Standalone body",
                 },
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
 
     output = tmp_path / "bundle"
     assert (
@@ -341,16 +385,20 @@ def test_resolves_an_unthreaded_room_message(monkeypatch, tmp_path) -> None:
         )
         == 0
     )
-    assert len(requests) == 1
+    assert len(requests) == 2
     assert requests[0].url.path.endswith("MessageService/GetMessage")
-    assert json.loads(requests[0].content) == {
+    assert _request_payload(requests[0]) == {
         "roomId": "R12345678901234",
         "eventId": "E22345678901234",
     }
     assert "Standalone body" in (output / "_index.md").read_text(encoding="utf-8")
+    assert "## Author" in (output / "_index.md").read_text(encoding="utf-8")
 
 
-def test_resolves_a_room_reply_through_its_thread(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("thread_summary", [None, {}])
+def test_resolves_a_room_reply_through_its_thread(
+    monkeypatch, tmp_path, thread_summary
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -364,62 +412,58 @@ def test_resolves_a_room_reply_through_its_thread(monkeypatch, tmp_path) -> None
                     "threadRootEventId": "E12345678901234",
                     "createdAt": "2026-09-19T10:01:00Z",
                     "body": "Reply body",
-                    "thread": {},
+                    "thread": thread_summary,
                 }
             }
         else:
             payload = {
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Uroot",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Uroot",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "Root body",
-                            }
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Uroot",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "Root body",
+                                }
+                            },
                         },
-                    },
-                    {
-                        "id": "E22345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Ureply",
-                        "createdAt": "2026-09-19T10:01:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E22345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Ureply",
-                                "threadRootEventId": "E12345678901234",
-                                "createdAt": "2026-09-19T10:01:00Z",
-                                "body": "Reply body",
-                            }
+                        {
+                            "id": "E22345678901234",
+                            "actorId": "Ureply",
+                            "createdAt": "2026-09-19T10:01:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E22345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Ureply",
+                                    "threadRootEventId": "E12345678901234",
+                                    "createdAt": "2026-09-19T10:01:00Z",
+                                    "body": "Reply body",
+                                }
+                            },
                         },
+                    ],
+                    "includes": {
+                        "users": {
+                            "Uroot": {"id": "Uroot", "displayName": "Root"},
+                            "Ureply": {"id": "Ureply", "displayName": "Reply"},
+                        }
                     },
-                ],
-                "includes": {
-                    "users": {
-                        "Uroot": {"id": "Uroot", "displayName": "Root"},
-                        "Ureply": {"id": "Ureply", "displayName": "Reply"},
-                    }
-                },
-                "page": {"hasOlder": False, "startCursor": ""},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
         return httpx.Response(200, json=payload, request=request)
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
 
     output = tmp_path / "bundle"
     assert (
@@ -432,7 +476,7 @@ def test_resolves_a_room_reply_through_its_thread(monkeypatch, tmp_path) -> None
         == 0
     )
     assert len(requests) == 2
-    assert json.loads(requests[1].content) == {
+    assert _request_payload(requests[1]) == {
         "roomId": "R12345678901234",
         "threadRootEventId": "E12345678901234",
         "limit": 500,
@@ -458,12 +502,7 @@ def test_rejects_a_room_lookup_that_returns_another_message(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
 
     output = tmp_path / "bundle"
     assert (
@@ -485,36 +524,33 @@ def test_rejects_inconsistent_message_event_without_publishing(
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Uroot",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Ureply",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "body",
-                            }
-                        },
-                    }
-                ],
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Ureply",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        }
+                    ],
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -533,46 +569,42 @@ def test_ignores_a_well_formed_non_message_event(monkeypatch, tmp_path) -> None:
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E32345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Uroot",
-                        "createdAt": "2026-09-19T09:59:00Z",
-                        "reactionAdded": {},
-                    },
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Uroot",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Uroot",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "body",
-                            }
+                "page": {
+                    "events": [
+                        {
+                            "id": "E32345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T09:59:00Z",
+                            "roomUpdated": {"roomId": "R12345678901234"},
                         },
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Uroot",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        },
+                    ],
+                    "includes": {
+                        "users": {"Uroot": {"id": "Uroot", "displayName": "Root"}}
                     },
-                ],
-                "includes": {
-                    "users": {"Uroot": {"id": "Uroot", "displayName": "Root"}}
-                },
-                "page": {"hasOlder": False, "startCursor": ""},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -603,7 +635,6 @@ def test_prepends_older_pages_and_merges_page_users(monkeypatch, tmp_path) -> No
             message["threadRootEventId"] = "E12345678901234"
         return {
             "id": event_id,
-            "roomId": "R12345678901234",
             "actorId": actor_id,
             "createdAt": timestamp,
             "messagePosted": {"message": message},
@@ -613,54 +644,55 @@ def test_prepends_older_pages_and_merges_page_users(monkeypatch, tmp_path) -> No
         requests.append(request)
         if len(requests) == 1:
             payload = {
-                "events": [
-                    message_event(
-                        "E12345678901234",
-                        "Uroot",
-                        "2026-09-19T10:00:00Z",
-                        "Root",
-                        root=True,
-                    ),
-                    message_event(
-                        "E22345678901234",
-                        "Unew",
-                        "2026-09-19T10:02:00Z",
-                        "Newest",
-                    ),
-                ],
-                "includes": {
-                    "users": {
-                        "Uroot": {"id": "Uroot", "displayName": "Root"},
-                        "Unew": {"id": "Unew", "displayName": "Newest author"},
-                    }
-                },
-                "page": {"hasOlder": True, "startCursor": "cursor-older"},
+                "page": {
+                    "events": [
+                        message_event(
+                            "E12345678901234",
+                            "Uroot",
+                            "2026-09-19T10:00:00Z",
+                            "Root",
+                            root=True,
+                        ),
+                        message_event(
+                            "E22345678901234",
+                            "Unew",
+                            "2026-09-19T10:02:00Z",
+                            "Newest",
+                        ),
+                    ],
+                    "includes": {
+                        "users": {
+                            "Uroot": {"id": "Uroot", "displayName": "Root"},
+                            "Unew": {"id": "Unew", "displayName": "Newest author"},
+                        }
+                    },
+                    "hasOlder": True,
+                    "startCursor": "cursor-older",
+                }
             }
         else:
             payload = {
-                "events": [
-                    message_event(
-                        "E32345678901234",
-                        "Uold",
-                        "2026-09-19T10:01:00Z",
-                        "Older",
-                    )
-                ],
-                "includes": {
-                    "users": {"Uold": {"id": "Uold", "displayName": "Older author"}}
-                },
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        message_event(
+                            "E32345678901234",
+                            "Uold",
+                            "2026-09-19T10:01:00Z",
+                            "Older",
+                        )
+                    ],
+                    "includes": {
+                        "users": {"Uold": {"id": "Uold", "displayName": "Older author"}}
+                    },
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
         return httpx.Response(200, json=payload, request=request)
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
 
     output = tmp_path / "bundle"
     assert (
@@ -673,7 +705,7 @@ def test_prepends_older_pages_and_merges_page_users(monkeypatch, tmp_path) -> No
         == 0
     )
     assert len(requests) == 2
-    assert json.loads(requests[1].content) == {
+    assert _request_payload(requests[1]) == {
         "roomId": "R12345678901234",
         "threadRootEventId": "E12345678901234",
         "limit": 500,
@@ -687,45 +719,49 @@ def test_prepends_older_pages_and_merges_page_users(monkeypatch, tmp_path) -> No
 def test_rejects_missing_or_repeated_pagination_cursors(monkeypatch, tmp_path) -> None:
     responses = [
         {
-            "events": [
-                {
-                    "id": "E12345678901234",
-                    "roomId": "R12345678901234",
-                    "actorId": "Uroot",
-                    "createdAt": "2026-09-19T10:00:00Z",
-                    "messagePosted": {
-                        "message": {
-                            "id": "E12345678901234",
-                            "roomId": "R12345678901234",
-                            "actorId": "Uroot",
-                            "createdAt": "2026-09-19T10:00:00Z",
-                            "body": "root",
-                        }
-                    },
-                }
-            ],
-            "page": {"hasOlder": True, "startCursor": "same"},
+            "page": {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "actorId": "Uroot",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Uroot",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "body": "root",
+                            }
+                        },
+                    }
+                ],
+                "hasOlder": True,
+                "startCursor": "same",
+            }
         },
         {
-            "events": [
-                {
-                    "id": "E22345678901234",
-                    "roomId": "R12345678901234",
-                    "actorId": "Ureply",
-                    "createdAt": "2026-09-19T10:01:00Z",
-                    "messagePosted": {
-                        "message": {
-                            "id": "E22345678901234",
-                            "roomId": "R12345678901234",
-                            "actorId": "Ureply",
-                            "threadRootEventId": "E12345678901234",
-                            "createdAt": "2026-09-19T10:01:00Z",
-                            "body": "reply",
-                        }
-                    },
-                }
-            ],
-            "page": {"hasOlder": True, "startCursor": "same"},
+            "page": {
+                "events": [
+                    {
+                        "id": "E22345678901234",
+                        "actorId": "Ureply",
+                        "createdAt": "2026-09-19T10:01:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E22345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "Ureply",
+                                "threadRootEventId": "E12345678901234",
+                                "createdAt": "2026-09-19T10:01:00Z",
+                                "body": "reply",
+                            }
+                        },
+                    }
+                ],
+                "hasOlder": True,
+                "startCursor": "same",
+            }
         },
     ]
     requests: list[httpx.Request] = []
@@ -737,12 +773,7 @@ def test_rejects_missing_or_repeated_pagination_cursors(monkeypatch, tmp_path) -
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -761,36 +792,32 @@ def test_rejects_a_missing_pagination_cursor(monkeypatch, tmp_path) -> None:
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "Uroot",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "Uroot",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "root",
-                            }
-                        },
-                    }
-                ],
-                "page": {"hasOlder": True},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "Uroot",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "Uroot",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "root",
+                                }
+                            },
+                        }
+                    ],
+                    "hasOlder": True,
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -817,7 +844,6 @@ def test_rejects_duplicate_events_across_pages(monkeypatch, tmp_path) -> None:
             message["threadRootEventId"] = "E12345678901234"
         return {
             "id": event_id,
-            "roomId": "R12345678901234",
             "actorId": "U",
             "createdAt": timestamp,
             "messagePosted": {"message": message},
@@ -830,27 +856,28 @@ def test_rejects_duplicate_events_across_pages(monkeypatch, tmp_path) -> None:
         calls += 1
         if calls == 1:
             payload = {
-                "events": [
-                    event("E12345678901234", "2026-09-19T10:00:00Z", root=True),
-                    event("E22345678901234", "2026-09-19T10:01:00Z"),
-                ],
-                "page": {"hasOlder": True, "startCursor": "older"},
+                "page": {
+                    "events": [
+                        event("E12345678901234", "2026-09-19T10:00:00Z", root=True),
+                        event("E22345678901234", "2026-09-19T10:01:00Z"),
+                    ],
+                    "hasOlder": True,
+                    "startCursor": "older",
+                }
             }
         else:
             payload = {
-                "events": [event("E22345678901234", "2026-09-19T10:01:00Z")],
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [event("E22345678901234", "2026-09-19T10:01:00Z")],
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
         return httpx.Response(200, json=payload, request=request)
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -869,52 +896,48 @@ def test_rejects_page_order_inconsistency(monkeypatch, tmp_path) -> None:
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "root",
-                            }
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "root",
+                                }
+                            },
                         },
-                    },
-                    {
-                        "id": "E22345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T09:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E22345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "threadRootEventId": "E12345678901234",
-                                "createdAt": "2026-09-19T09:00:00Z",
-                                "body": "reply",
-                            }
+                        {
+                            "id": "E22345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T09:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E22345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "threadRootEventId": "E12345678901234",
+                                    "createdAt": "2026-09-19T09:00:00Z",
+                                    "body": "reply",
+                                }
+                            },
                         },
-                    },
-                ],
-                "page": {"hasOlder": False, "startCursor": ""},
+                    ],
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -949,7 +972,6 @@ def test_hydrates_missing_authors_in_first_seen_batches_of_100(
             message["threadRootEventId"] = root_id
         return {
             "id": event_id,
-            "roomId": "R12345678901234",
             "actorId": actor_id,
             "createdAt": timestamp,
             "messagePosted": {"message": message},
@@ -958,11 +980,14 @@ def test_hydrates_missing_authors_in_first_seen_batches_of_100(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("ThreadService/GetThreadEvents"):
             payload = {
-                "events": [event(index) for index in range(101)],
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [event(index) for index in range(101)],
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
         else:
-            user_ids = json.loads(request.content)["userIds"]
+            user_ids = _request_payload(request)["userIds"]
             batch_requests.append(user_ids)
             payload = {
                 "users": [
@@ -979,12 +1004,7 @@ def test_hydrates_missing_authors_in_first_seen_batches_of_100(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1007,24 +1027,26 @@ def test_rejects_an_unrequested_batch_user_without_publishing(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("ThreadService/GetThreadEvents"):
             payload = {
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U0",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U0",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "body",
-                            }
-                        },
-                    }
-                ],
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U0",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U0",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        }
+                    ],
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
         else:
             payload = {"users": [{"user": {"id": "U-other", "displayName": "Other"}}]}
@@ -1032,12 +1054,7 @@ def test_rejects_an_unrequested_batch_user_without_publishing(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1055,24 +1072,26 @@ def test_omitted_batch_users_use_unknown_author(monkeypatch, tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("ThreadService/GetThreadEvents"):
             payload = {
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U0",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U0",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "body",
-                            }
-                        },
-                    }
-                ],
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U0",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U0",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "body",
+                                }
+                            },
+                        }
+                    ],
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
         else:
             payload = {"users": []}
@@ -1080,12 +1099,7 @@ def test_omitted_batch_users_use_unknown_author(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1112,7 +1126,6 @@ def test_normalizes_untrusted_text_without_escaping_message_markdown(
     ) -> dict[str, object]:
         return {
             "id": event_id,
-            "roomId": "R12345678901234",
             "actorId": actor_id,
             "createdAt": timestamp,
             "messagePosted": {"message": message},
@@ -1180,28 +1193,26 @@ def test_normalizes_untrusted_text_without_escaping_message_markdown(
         return httpx.Response(
             200,
             json={
-                "events": events,
-                "includes": {
-                    "users": {
-                        "U1": {"id": "U1", "displayName": "  Alice\n#  "},
-                        "U2": {"id": "U2", "login": "  bob\t"},
-                        "U3": {"id": "U3", "displayName": "Deleted"},
-                        "U4": {"id": "U4", "displayName": "Unavailable"},
-                    }
-                },
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": events,
+                    "includes": {
+                        "users": {
+                            "U1": {"id": "U1", "displayName": "  Alice\n#  "},
+                            "U2": {"id": "U2", "login": "  bob\t"},
+                            "U3": {"id": "U3", "displayName": "Deleted"},
+                            "U4": {"id": "U4", "displayName": "Unavailable"},
+                        }
+                    },
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1231,42 +1242,44 @@ def test_downloads_and_renders_ordered_attachments_without_api_auth(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("ThreadService/GetThreadEvents"):
             payload = {
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "attachments": [
-                                    {
-                                        "filename": "photo.png",
-                                        "mimeType": "image/png",
-                                        "description": "A photo",
-                                        "assetUrl": {
-                                            "url": "https://assets.example/photo.png?sig=fake"
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "attachments": [
+                                        {
+                                            "filename": "photo.png",
+                                            "contentType": "image/png",
+                                            "description": "A photo",
+                                            "assetUrl": {
+                                                "url": "https://assets.example/photo.png?sig=fake"
+                                            },
                                         },
-                                    },
-                                    {
-                                        "filename": "doc.pdf",
-                                        "mimeType": "application/pdf",
-                                        "description": "Read me",
-                                        "assetUrl": {
-                                            "url": "https://assets.example/doc.pdf?sig=fake"
+                                        {
+                                            "filename": "doc.pdf",
+                                            "contentType": "application/pdf",
+                                            "description": "Read me",
+                                            "assetUrl": {
+                                                "url": "https://assets.example/doc.pdf?sig=fake"
+                                            },
                                         },
-                                    },
-                                ],
-                            }
-                        },
-                    }
-                ],
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-                "page": {"hasOlder": False, "startCursor": ""},
+                                    ],
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
             return httpx.Response(200, json=payload, request=request)
         asset_requests.append(request)
@@ -1275,12 +1288,7 @@ def test_downloads_and_renders_ordered_attachments_without_api_auth(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1312,50 +1320,52 @@ def test_attachment_names_are_safe_unique_and_percent_encoded(
             attachments = [
                 {
                     "filename": "../a #.txt",
-                    "mimeType": "text/plain",
+                    "contentType": "text/plain",
                     "assetUrl": {"url": "https://assets.example/1"},
                 },
                 {
                     "filename": "a #.txt",
-                    "mimeType": "text/plain",
+                    "contentType": "text/plain",
                     "assetUrl": {"url": "https://assets.example/2"},
                 },
                 {
                     "filename": "_index.md",
-                    "mimeType": "text/plain",
+                    "contentType": "text/plain",
                     "assetUrl": {"url": "https://assets.example/3"},
                 },
                 {
                     "filename": "",
-                    "mimeType": "image/png\r\n",
+                    "contentType": "image/png\r\n",
                     "assetUrl": {"url": "https://assets.example/4"},
                 },
                 {
                     "filename": "dir\\attachment",
-                    "mimeType": "text/plain",
+                    "contentType": "text/plain",
                     "assetUrl": {"url": "https://assets.example/5"},
                 },
             ]
             payload = {
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "attachments": attachments,
-                            }
-                        },
-                    }
-                ],
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "attachments": attachments,
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
             return httpx.Response(200, json=payload, request=request)
         asset_number += 1
@@ -1365,12 +1375,7 @@ def test_attachment_names_are_safe_unique_and_percent_encoded(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1408,6 +1413,7 @@ def test_existing_output_blocks_network_without_force(monkeypatch, tmp_path) -> 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
     monkeypatch.setattr(httpx, "Client", client)
+    monkeypatch.setattr(httpx, "AsyncClient", client)
     assert (
         main(
             [
@@ -1430,37 +1436,34 @@ def test_force_replaces_existing_output_after_success(monkeypatch, tmp_path) -> 
         return httpx.Response(
             200,
             json={
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "body": "new",
-                            }
-                        },
-                    }
-                ],
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-                "page": {"hasOlder": False, "startCursor": ""},
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "body": "new",
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             },
             request=request,
         )
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     assert (
         main(
             [
@@ -1485,12 +1488,7 @@ def test_failed_force_export_preserves_existing_output(monkeypatch, tmp_path) ->
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     assert (
         main(
             [
@@ -1517,42 +1515,39 @@ def test_rejects_unusable_attachment_urls_without_publishing(
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = {
-            "events": [
-                {
-                    "id": "E12345678901234",
-                    "roomId": "R12345678901234",
-                    "actorId": "U",
-                    "createdAt": "2026-09-19T10:00:00Z",
-                    "messagePosted": {
-                        "message": {
-                            "id": "E12345678901234",
-                            "roomId": "R12345678901234",
-                            "actorId": "U",
-                            "createdAt": "2026-09-19T10:00:00Z",
-                            "attachments": [
-                                {
-                                    "filename": "file.txt",
-                                    "mimeType": "text/plain",
-                                    "assetUrl": asset_url,
-                                }
-                            ],
-                        }
-                    },
-                }
-            ],
-            "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-            "page": {"hasOlder": False, "startCursor": ""},
+            "page": {
+                "events": [
+                    {
+                        "id": "E12345678901234",
+                        "actorId": "U",
+                        "createdAt": "2026-09-19T10:00:00Z",
+                        "messagePosted": {
+                            "message": {
+                                "id": "E12345678901234",
+                                "roomId": "R12345678901234",
+                                "actorId": "U",
+                                "createdAt": "2026-09-19T10:00:00Z",
+                                "attachments": [
+                                    {
+                                        "filename": "file.txt",
+                                        "contentType": "text/plain",
+                                        "assetUrl": asset_url,
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                ],
+                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                "hasOlder": False,
+                "startCursor": "",
+            }
         }
         return httpx.Response(200, json=payload, request=request)
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(
@@ -1577,40 +1572,42 @@ def test_redirected_or_late_failed_asset_preserves_existing_output(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("ThreadService/GetThreadEvents"):
             payload = {
-                "events": [
-                    {
-                        "id": "E12345678901234",
-                        "roomId": "R12345678901234",
-                        "actorId": "U",
-                        "createdAt": "2026-09-19T10:00:00Z",
-                        "messagePosted": {
-                            "message": {
-                                "id": "E12345678901234",
-                                "roomId": "R12345678901234",
-                                "actorId": "U",
-                                "createdAt": "2026-09-19T10:00:00Z",
-                                "attachments": [
-                                    {
-                                        "filename": "first.txt",
-                                        "mimeType": "text/plain",
-                                        "assetUrl": {
-                                            "url": "https://assets.example/first"
+                "page": {
+                    "events": [
+                        {
+                            "id": "E12345678901234",
+                            "actorId": "U",
+                            "createdAt": "2026-09-19T10:00:00Z",
+                            "messagePosted": {
+                                "message": {
+                                    "id": "E12345678901234",
+                                    "roomId": "R12345678901234",
+                                    "actorId": "U",
+                                    "createdAt": "2026-09-19T10:00:00Z",
+                                    "attachments": [
+                                        {
+                                            "filename": "first.txt",
+                                            "contentType": "text/plain",
+                                            "assetUrl": {
+                                                "url": "https://assets.example/first"
+                                            },
                                         },
-                                    },
-                                    {
-                                        "filename": "second.txt",
-                                        "mimeType": "text/plain",
-                                        "assetUrl": {
-                                            "url": "https://assets.example/second"
+                                        {
+                                            "filename": "second.txt",
+                                            "contentType": "text/plain",
+                                            "assetUrl": {
+                                                "url": "https://assets.example/second"
+                                            },
                                         },
-                                    },
-                                ],
-                            }
-                        },
-                    }
-                ],
-                "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
-                "page": {"hasOlder": False, "startCursor": ""},
+                                    ],
+                                }
+                            },
+                        }
+                    ],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                    "hasOlder": False,
+                    "startCursor": "",
+                }
             }
             return httpx.Response(200, json=payload, request=request)
         asset_requests.append(request)
@@ -1624,12 +1621,7 @@ def test_redirected_or_late_failed_asset_preserves_existing_output(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     assert (
         main(
             [
@@ -1652,6 +1644,7 @@ def test_redirected_or_late_failed_asset_preserves_existing_output(
         (403, "permission denied"),
         (404, "resource not found"),
         (500, "server failure"),
+        (503, "server failure"),
     ],
 )
 def test_classifies_http_failures_without_private_details(
@@ -1662,12 +1655,7 @@ def test_classifies_http_failures_without_private_details(
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     assert (
         main(
             [
@@ -1684,7 +1672,9 @@ def test_classifies_http_failures_without_private_details(
     assert captured.out == ""
 
 
-def test_classifies_connectrpc_and_json_failures(monkeypatch, tmp_path, capsys) -> None:
+def test_classifies_connectrpc_and_protobuf_failures(
+    monkeypatch, tmp_path, capsys
+) -> None:
     responses = [
         httpx.Response(
             400,
@@ -1700,23 +1690,18 @@ def test_classifies_connectrpc_and_json_failures(monkeypatch, tmp_path, capsys) 
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     args = [
         "https://frontend.example.test/chat/api.example.test/R12345678901234/E12345678901234/m/E22345678901234",
         str(tmp_path / "bundle"),
     ]
     assert main(args) == 1
     captured = capsys.readouterr()
-    assert "ConnectRPC failure" in captured.err
+    assert "permission denied" in captured.err
     assert "private details" not in captured.err
     assert main(args) == 1
     captured = capsys.readouterr()
-    assert "malformed JSON response" in captured.err
+    assert "malformed protobuf response" in captured.err
 
 
 def test_classifies_network_timeouts(monkeypatch, tmp_path, capsys) -> None:
@@ -1725,12 +1710,7 @@ def test_classifies_network_timeouts(monkeypatch, tmp_path, capsys) -> None:
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     assert (
         main(
             [
@@ -1743,6 +1723,118 @@ def test_classifies_network_timeouts(monkeypatch, tmp_path, capsys) -> None:
     captured = capsys.readouterr()
     assert "network timeout" in captured.err
     assert "private timeout details" not in captured.err
+
+
+@pytest.mark.parametrize("reply_count", [499, 500])
+def test_complete_full_page_uses_protobuf_pagination_default(
+    monkeypatch, tmp_path, reply_count
+) -> None:
+    requests: list[httpx.Request] = []
+    root_id = "E12345678901234"
+
+    def event(index):
+        event_id = root_id if index == 0 else f"E{index:014d}"
+        message = {
+            "id": event_id,
+            "roomId": "R12345678901234",
+            "actorId": "U",
+            "createdAt": "2026-09-19T10:00:00Z",
+            "body": f"body {index}",
+        }
+        if index:
+            message["threadRootEventId"] = root_id
+        return {
+            "id": event_id,
+            "actorId": "U",
+            "createdAt": "2026-09-19T10:00:00Z",
+            "messagePosted": {"message": message},
+        }
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "page": {
+                    "events": [event(index) for index in range(reply_count + 1)],
+                    "includes": {"users": {"U": {"id": "U", "displayName": "Author"}}},
+                }
+            },
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    _install_transport(monkeypatch, handler)
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                f"https://api.example.test/chat/-/R12345678901234/{root_id}/m/{root_id}",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert len(requests) == 1
+    content = (output / "_index.md").read_text(encoding="utf-8")
+    assert content.count("## Author") == reply_count + 1
+    assert content.rstrip().endswith(f"body {reply_count}")
+
+
+def test_api_redirect_is_rejected_without_following_or_exposing_details(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(
+            307,
+            headers={"location": "https://untrusted.example/private?secret=fake"},
+            content=b"private redirect details",
+            request=request,
+        )
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    _install_transport(monkeypatch, handler)
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://api.example.test/chat/-/R12345678901234/E12345678901234/m/E12345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert len(requests) == 1
+    assert not output.exists()
+    captured = capsys.readouterr()
+    assert captured.err == "error: redirect rejected\n"
+    assert captured.out == ""
+
+
+def test_transport_failure_has_a_safe_diagnostic(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request):
+        raise httpx.ConnectError("private TLS details test-key", request=request)
+
+    monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
+    monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
+    _install_transport(monkeypatch, handler)
+    output = tmp_path / "bundle"
+    assert (
+        main(
+            [
+                "https://api.example.test/chat/-/R12345678901234/E12345678901234/m/E12345678901234",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
+    assert capsys.readouterr().err == "error: transport or TLS failure\n"
 
 
 def test_accepts_live_chatto_page_envelope(monkeypatch, tmp_path) -> None:
@@ -1777,12 +1869,7 @@ def test_accepts_live_chatto_page_envelope(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setenv("CHATTO_THREADDUMP_SERVER_URL", "https://api.example.test")
     monkeypatch.setenv("CHATTO_THREADDUMP_API_KEY", "test-key")
-    real_client = httpx.Client
-    monkeypatch.setattr(
-        httpx,
-        "Client",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    _install_transport(monkeypatch, handler)
     output = tmp_path / "bundle"
     assert (
         main(

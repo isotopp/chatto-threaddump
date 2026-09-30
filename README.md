@@ -2,8 +2,8 @@
 
 `chatto-threaddump` is a read-only command-line program that exports one
 complete Chatto thread as a deterministic directory bundle: `_index.md` plus
-local copies of its attachments. It targets Chatto `v0.5.0-beta.1`'s unary
-ConnectRPC JSON API.
+local copies of its attachments. It targets Chatto `v0.5.0-beta.10` through
+`chattolib==0.5.0b10`'s generated synchronous ConnectRPC protobuf clients.
 
 ## Installation
 
