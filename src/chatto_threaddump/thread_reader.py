@@ -77,7 +77,7 @@ class ThreadEventsClient(Protocol):
 
 @dataclass(frozen=True)
 class ThreadPage:
-    """Validated thread data and continuation metadata from one API page."""
+    """Validated thread data and pagination metadata."""
 
     starter: ThreadMessage
     replies: tuple[ThreadMessage, ...]
@@ -87,8 +87,18 @@ class ThreadPage:
 
     @property
     def messages(self) -> tuple[ThreadMessage, ...]:
-        """Return the starter followed by this page's chronological replies."""
+        """Return the starter followed by chronological replies."""
         return (self.starter, *self.replies)
+
+
+@dataclass(frozen=True)
+class _ValidatedPage:
+    starter: ThreadMessage | None
+    replies: tuple[ThreadMessage, ...]
+    included_users: Mapping[str, ThreadUser]
+    has_older: bool
+    start_cursor: str
+    event_ids: tuple[str, ...]
 
 
 async def read_thread_page(
@@ -99,20 +109,129 @@ async def read_thread_page(
     api_key: str,
 ) -> ThreadPage:
     """Read and validate the initial page for the requested thread."""
+    page = await _read_page(
+        client,
+        room_id,
+        root_event_id,
+        api_key=api_key,
+        before=None,
+        initial=True,
+    )
+    if page.starter is None:
+        raise ThreadReadError("thread root is missing or misplaced")
+    return ThreadPage(
+        starter=page.starter,
+        replies=page.replies,
+        included_users=page.included_users,
+        has_older=page.has_older,
+        start_cursor=page.start_cursor,
+    )
+
+
+async def read_thread(
+    client: ThreadEventsClient,
+    room_id: str,
+    root_event_id: str,
+    *,
+    api_key: str,
+) -> ThreadPage:
+    """Read all pages and return the complete chronological thread."""
+    current = await _read_page(
+        client,
+        room_id,
+        root_event_id,
+        api_key=api_key,
+        before=None,
+        initial=True,
+    )
+    if current.starter is None:
+        raise ThreadReadError("thread root is missing or misplaced")
+
+    starter = current.starter
+    replies = list(current.replies)
+    included_users = dict(current.included_users)
+    seen_event_ids = set(current.event_ids)
+    seen_cursors: set[str] = set()
+    root_time = _timestamp(starter.created_at)
+    root_time_key = (root_time.seconds, root_time.nanos)
+    for message in current.replies:
+        message_time = _timestamp(message.created_at)
+        if (message_time.seconds, message_time.nanos) < root_time_key:
+            raise ThreadReadError("reply precedes thread root")
+    newer_reply_boundary = (
+        _timestamp(current.replies[0].created_at) if current.replies else None
+    )
+
+    while current.has_older:
+        cursor = current.start_cursor
+        if not cursor or cursor in seen_cursors:
+            raise ThreadReadError("invalid thread pagination cursor")
+        seen_cursors.add(cursor)
+
+        older = await _read_page(
+            client,
+            room_id,
+            root_event_id,
+            api_key=api_key,
+            before=cursor,
+            initial=False,
+        )
+        if any(event_id in seen_event_ids for event_id in older.event_ids):
+            raise ThreadReadError("duplicate thread event")
+        seen_event_ids.update(older.event_ids)
+
+        if older.replies and newer_reply_boundary is not None:
+            older_last_time = _timestamp(older.replies[-1].created_at)
+            current_first_time = newer_reply_boundary
+            if (older_last_time.seconds, older_last_time.nanos) > (
+                current_first_time.seconds,
+                current_first_time.nanos,
+            ):
+                raise ThreadReadError("older thread page is out of order")
+        for message in older.replies:
+            message_time = _timestamp(message.created_at)
+            if (message_time.seconds, message_time.nanos) < root_time_key:
+                raise ThreadReadError("reply precedes thread root")
+
+        if older.replies:
+            newer_reply_boundary = _timestamp(older.replies[0].created_at)
+
+        replies = [*older.replies, *replies]
+        included_users.update(older.included_users)
+        current = older
+
+    return ThreadPage(
+        starter=starter,
+        replies=tuple(replies),
+        included_users=included_users,
+        has_older=False,
+        start_cursor="",
+    )
+
+
+async def _read_page(
+    client: ThreadEventsClient,
+    room_id: str,
+    root_event_id: str,
+    *,
+    api_key: str,
+    before: str | None,
+    initial: bool,
+) -> _ValidatedPage:
     if not room_id or not root_event_id:
         raise ThreadReadError("a room ID and thread root ID are required")
 
     request_factory: Any = getattr(  # noqa: B009 - generated protobuf module is dynamic.
         room_timeline_pb2, "GetThreadEventsRequest"
     )
-    request = cast(
-        Message,
-        request_factory(
-            room_id=room_id,
-            thread_root_event_id=root_event_id,
-            limit=500,
-        ),
-    )
+    request_values: dict[str, Any] = {
+        "room_id": room_id,
+        "thread_root_event_id": root_event_id,
+        "limit": 500,
+    }
+    if before is not None:
+        request_values["before"] = before
+    request = cast(Message, request_factory(**request_values))
     try:
         response = await client.get_thread_events(
             request, headers={"Authorization": f"Bearer {api_key}"}
@@ -132,20 +251,28 @@ async def read_thread_page(
         raise ThreadReadError("malformed Chatto thread response")
 
     page: Any = response.page
-    return _validate_page(page, room_id, root_event_id)
+    return _validate_page(page, room_id, root_event_id, initial=initial)
 
 
 def _validate_page(
     page: _TimelinePage,
     room_id: str,
     root_event_id: str,
-) -> ThreadPage:
+    *,
+    initial: bool,
+) -> _ValidatedPage:
     users = _validate_users(page)
     messages: list[ThreadMessage] = []
+    event_ids: list[str] = []
+    seen_event_ids: set[str] = set()
     previous_time: tuple[int, int] | None = None
 
     for event in page.events:
         event_id = _required_string(event.id, "event ID")
+        if event_id in seen_event_ids:
+            raise ThreadReadError("duplicate thread event")
+        seen_event_ids.add(event_id)
+        event_ids.append(event_id)
         actor_id = _required_string(event.actor_id, "event actor ID")
         if not event.HasField("created_at"):
             raise ThreadReadError("malformed Chatto thread timestamp")
@@ -185,15 +312,21 @@ def _validate_page(
             raise ThreadReadError("inconsistent Chatto reply thread root")
         messages.append(message)
 
-    if not messages or messages[0].id != root_event_id:
+    root_positions = [
+        index for index, message in enumerate(messages) if message.id == root_event_id
+    ]
+    if initial and root_positions != [0]:
         raise ThreadReadError("thread root is missing or misplaced")
+    if not initial and root_positions:
+        raise ThreadReadError("older thread page contains the root")
 
-    return ThreadPage(
-        starter=messages[0],
-        replies=tuple(messages[1:]),
+    return _ValidatedPage(
+        starter=messages[0] if initial else None,
+        replies=tuple(messages[1:] if initial else messages),
         included_users=users,
         has_older=page.has_older,
         start_cursor=page.start_cursor,
+        event_ids=tuple(event_ids),
     )
 
 
