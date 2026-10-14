@@ -9,8 +9,10 @@ from typing import Any
 from zipfile import ZipFile
 
 import pytest
+from chattolib import ChattoClient
 from chattolib._pb.chatto.api.v1 import message_types_pb2 as _message_types_pb2
 from chattolib._pb.chatto.api.v1 import room_timeline_pb2 as _room_timeline_pb2
+from chattolib._pb.chatto.api.v1 import user_service_pb2 as _user_service_pb2
 from chattolib._pb.chatto.api.v1 import users_pb2 as _users_pb2
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
 
@@ -33,7 +35,76 @@ class _ProtoTypes:
 message_types_pb2 = _ProtoTypes(_message_types_pb2)
 room_timeline_pb2 = _ProtoTypes(_room_timeline_pb2)
 users_pb2 = _ProtoTypes(_users_pb2)
+user_service_pb2 = _ProtoTypes(_user_service_pb2)
 timestamp_pb2 = _ProtoTypes(_timestamp_pb2)
+
+
+@pytest.mark.parametrize("hydrate_author", [False, True])
+def test_worker_uses_sdk_protobuf_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hydrate_author: bool
+) -> None:
+    calls: list[str] = []
+    replies: list[str] = []
+
+    async def get_thread_events(request: Any, *, headers: dict[str, str]) -> Any:
+        assert headers == {"Authorization": "Bearer fake-bot-key"}
+        calls.append("thread")
+        response = _thread_response(request.thread_root_event_id)
+        if hydrate_author:
+            response.page.includes.users.clear()
+        return response
+
+    async def batch_get_users(request: Any, *, headers: dict[str, str]) -> Any:
+        assert headers == {"Authorization": "Bearer fake-bot-key"}
+        assert list(request.user_ids) == [AUTHOR_ID]
+        calls.append("authors")
+        return user_service_pb2.BatchGetUsersResponse(
+            users=[{"user": users_pb2.User(id=AUTHOR_ID, display_name="Alice")}]
+        )
+
+    async def upload_attachment(
+        room_id: str, file_path: Path, **kwargs: object
+    ) -> object:
+        assert room_id == ROOM_ID
+        assert kwargs["content_type"] == "application/zip"
+        with ZipFile(file_path) as archive:
+            assert b"Alice" in archive.read(archive.namelist()[0])
+        calls.append("upload")
+        return SimpleNamespace(id="fake-archive-asset")
+
+    async def post_message(room_id: str, body: str, **kwargs: object) -> object:
+        assert room_id == ROOM_ID
+        if kwargs.get("in_reply_to"):
+            replies.append(body)
+        else:
+            assert kwargs["attachment_asset_ids"] == ["fake-archive-asset"]
+            calls.append("publish")
+        return object()
+
+    services: Any = SimpleNamespace(
+        threads=SimpleNamespace(get_thread_events=get_thread_events),
+        user=SimpleNamespace(batch_get_users=batch_get_users),
+    )
+    client = ChattoClient(token="fake-bot-key", service_clients=services)
+    monkeypatch.setattr(client, "upload_attachment", upload_attachment)
+    monkeypatch.setattr(client, "post_message", post_message)
+    asyncio.run(
+        process_dump_request(
+            client,
+            DumpRequest(ROOM_ID, "Ecommand00000001", "Eroot00000000001"),
+            api_key="fake-bot-key",
+            temp_root=tmp_path / "tmpdir",
+        )
+    )
+
+    expected = (
+        ["thread", "authors", "upload", "publish"]
+        if hydrate_author
+        else ["thread", "upload", "publish"]
+    )
+    assert calls == expected
+    assert replies == []
+    assert list((tmp_path / "tmpdir").iterdir()) == []
 
 
 def _thread_response(root_id: str) -> Any:
@@ -64,6 +135,7 @@ def _thread_response(root_id: str) -> Any:
 
 class _FakeChattoClient:
     def __init__(self) -> None:
+        self.services = SimpleNamespace(threads=self, user=self)
         self.top_level_posts = 0
         self.uploaded_archives: list[Path] = []
         self.replies: list[tuple[str, str]] = []
@@ -181,6 +253,7 @@ def test_archive_read_failure_gets_one_sanitized_reply_and_cleans_parent(
 
         def __init__(self) -> None:
             self.replies = []
+            self.services = SimpleNamespace(threads=self, user=self)
 
         async def get_thread_events(self, _request: Any, *, headers=None) -> Any:
             raise RuntimeError("private body fake-bot-key signed-url")

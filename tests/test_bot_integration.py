@@ -140,7 +140,7 @@ class _FakeClient:
         self.replies: list[tuple[str, str]] = []
         self.top_level_posts: list[tuple[str, list[str], dict[str, object]]] = []
         self.uploads: list[tuple[str, str, str, bytes]] = []
-        self.services = SimpleNamespace(user=SimpleNamespace(get_user=self.get_user))
+        self.services = SimpleNamespace(threads=self, user=self)
 
     async def me(self) -> SimpleNamespace:
         return SimpleNamespace(id=BOT_ID)

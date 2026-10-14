@@ -4,7 +4,7 @@ import asyncio
 import os
 import tempfile
 import unicodedata
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +50,7 @@ async def create_thread_archive(
     api_key: str,
     temp_root: Path,
     asset_transport: httpx.AsyncBaseTransport | None = None,
-) -> AsyncIterator[ThreadArchive]:
+) -> AsyncGenerator[ThreadArchive]:
     """Build and yield a complete isolated archive, then remove its parent.
 
     The yielded ZIP remains available for the duration of the context. Each

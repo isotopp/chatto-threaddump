@@ -1,18 +1,43 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from chatto_threaddump.archive import create_thread_archive
-from chatto_threaddump.chatto_replies import reply_to_event
+from chatto_threaddump.chatto_replies import RPC_TIMEOUT_SECONDS, reply_to_event
 from chatto_threaddump.contracts import DumpRequest
 from chatto_threaddump.publisher import publish_thread_archive
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_REPLY = "The thread dump could not be completed."
+
+
+class _ArchiveReader:
+    """Keep archive protobuf reads on the SDK's raw service interfaces."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def get_thread_events(
+        self, request: Any, *, headers: Mapping[str, str] | None = None
+    ) -> Any:
+        async with asyncio.timeout(RPC_TIMEOUT_SECONDS):
+            return await self._client.services.threads.get_thread_events(
+                request, headers=dict(headers) if headers is not None else None
+            )
+
+    async def batch_get_users(
+        self, request: Any, *, headers: Mapping[str, str] | None = None
+    ) -> Any:
+        async with asyncio.timeout(RPC_TIMEOUT_SECONDS):
+            return await self._client.services.user.batch_get_users(
+                request, headers=dict(headers) if headers is not None else None
+            )
 
 
 async def process_dump_request(
@@ -31,7 +56,7 @@ async def process_dump_request(
     """
     try:
         async with create_thread_archive(
-            client,
+            _ArchiveReader(client),
             request.room_id,
             request.thread_root_event_id,
             api_key=api_key,
