@@ -121,6 +121,36 @@ def test_writes_transcript_with_included_and_hydrated_authors(tmp_path: Path) ->
     assert "Uincluded" not in path.read_text(encoding="utf-8")
 
 
+def test_large_transcript_write_yields_to_other_event_loop_work(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        finished = asyncio.Event()
+        ticks = 0
+
+        async def observe_loop() -> None:
+            nonlocal ticks
+            while not finished.is_set():
+                ticks += 1
+                await asyncio.sleep(0)
+
+        observer = asyncio.create_task(observe_loop())
+        try:
+            path = await write_transcript(
+                [_message("Eroot00000000001", "Uauthor", body="x" * 1_000_000)],
+                {"Uauthor": users_pb2.User(id="Uauthor", display_name="Author")},
+                _FakeUsersClient([]),
+                api_key="fake-api-key",
+                output_dir=tmp_path,
+            )
+        finally:
+            finished.set()
+            await observer
+
+        assert ticks > 0
+        assert path.stat().st_size > 1_000_000
+
+    asyncio.run(scenario())
+
+
 def test_hydrates_unique_authors_in_first_seen_batches_of_at_most_100(
     tmp_path: Path,
 ) -> None:

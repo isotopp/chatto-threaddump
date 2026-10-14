@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -10,6 +11,8 @@ from chattolib._pb.chatto.api.v1 import user_service_pb2
 from google.protobuf.message import Message
 
 from chatto_threaddump.thread_reader import ThreadMessage, ThreadUser
+
+_WRITE_CHUNK_CHARACTERS = 64 * 1024
 
 
 class TranscriptError(Exception):
@@ -39,22 +42,56 @@ async def write_transcript(
         raise TranscriptError("thread contains no messages")
 
     users = await _hydrate_authors(client, api_key, messages, included_users)
-    rendered = [
-        "# Chatto thread",
-        "",
-        f"Started: {_escape_metadata(_timestamp(messages[0]))}",
-    ]
+    path = output_dir / "_index.md"
+    await _write_transcript(path, messages, users, attachment_lines)
+    return path
+
+
+async def _write_transcript(
+    path: Path,
+    messages: Sequence[ThreadMessage],
+    users: Mapping[str, ThreadUser],
+    attachment_lines: Mapping[str, Sequence[str]] | None,
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as output:
+        buffered: list[str] = []
+        buffered_characters = 0
+        for fragment in _transcript_fragments(messages, users, attachment_lines):
+            offset = 0
+            while offset < len(fragment):
+                available = _WRITE_CHUNK_CHARACTERS - buffered_characters
+                piece = fragment[offset : offset + available]
+                buffered.append(piece)
+                buffered_characters += len(piece)
+                offset += len(piece)
+                if buffered_characters == _WRITE_CHUNK_CHARACTERS:
+                    output.write("".join(buffered))
+                    buffered.clear()
+                    buffered_characters = 0
+                    await asyncio.sleep(0)
+        if buffered:
+            output.write("".join(buffered))
+
+
+def _transcript_fragments(
+    messages: Sequence[ThreadMessage],
+    users: Mapping[str, ThreadUser],
+    attachment_lines: Mapping[str, Sequence[str]] | None,
+) -> Iterable[str]:
+    yield f"# Chatto thread\n\nStarted: {_escape_metadata(_timestamp(messages[0]))}"
     for message in messages:
         user = users.get(message.actor_id)
-        rendered.extend(("", f"## {_author_label(user)}", "", _message_body(message)))
+        yield f"\n\n## {_author_label(user)}\n\n"
+        yield _message_body(message)
         if attachment_lines is not None:
             links = attachment_lines.get(message.id, ())
             if links:
-                rendered.extend(("", *(_clean_text(line) for line in links)))
-
-    path = output_dir / "_index.md"
-    path.write_text("\n".join(rendered) + "\n", encoding="utf-8")
-    return path
+                yield "\n\n"
+                for index, link in enumerate(links):
+                    if index:
+                        yield "\n"
+                    yield _clean_text(link)
+    yield "\n"
 
 
 async def _hydrate_authors(

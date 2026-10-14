@@ -1,7 +1,7 @@
 [project]
 name = "chatto-threaddump"
 version = "0.1.0"
-description = "Export a Chatto thread as Markdown"
+description = "Run a bot that publishes requested Chatto thread dumps"
 readme = "README.md"
 authors = [
     { name = "Kristian Koehntopp", email = "kris-git@koehntopp.de" }
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-chatto-threaddump = "chatto_threaddump:main"
+chatto-threaddump = "chatto_threaddump.runtime:main"
 
 [build-system]
 requires = ["uv_build>=0.9.27,<0.10.0"]
