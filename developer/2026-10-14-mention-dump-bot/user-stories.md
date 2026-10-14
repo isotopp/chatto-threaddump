@@ -298,13 +298,6 @@ queued requests.
 5. Cleanup is scoped to the request's unique parent and cannot delete another
    request's data or files outside the temporary location.
 
-## US-8: Deployment — out of scope
-
-Removed from this epic at the user's explicit request. Do not derive tickets,
-acceptance obligations, or dependencies from deployment. No changes to
-`kris-kvm`, Ansible, systemd units, or server installation are authorized by this
-implementation plan. The eventual hosting environment is background only.
-
 ## API evidence and hosting background
 
 The current repository pins `chattolib==0.5.0b10`. Target the documented Chatto
