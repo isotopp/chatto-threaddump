@@ -37,8 +37,8 @@ in Python 3.14 using the repository's `uv` workflow.
 - Publishing the ZIP to the channel is intentional, irrespective of differences
   between thread and channel membership. Do not add a membership comparison.
 - Requests, downloads, uploads, and posts are not retried automatically.
-- Deployment belongs to the Chatto Ansible role in `~/Source/kris-kvm`, using
-  the existing `chatto` account and a permanent user service like RSS bridge.
+- Deployment and Ansible integration are outside this epic. The planned hosting
+  environment is background context only, not an implementation obligation.
 
 The old read-only, stateless CLI restrictions are superseded for this epic.
 Posting acknowledgments, errors, help, and ZIP attachments is explicitly in
@@ -298,45 +298,14 @@ queued requests.
 5. Cleanup is scoped to the request's unique parent and cannot delete another
    request's data or files outside the temporary location.
 
-## US-8: Deploy with the existing Chatto Ansible role
+## US-8: Deployment — out of scope
 
-As the server operator, I want Ansible to install and supervise the bot under
-the existing Chatto account, so that it runs alongside the other Chatto services.
+Removed from this epic at the user's explicit request. Do not derive tickets,
+acceptance obligations, or dependencies from deployment. No changes to
+`kris-kvm`, Ansible, systemd units, or server installation are authorized by this
+implementation plan. The eventual hosting environment is background only.
 
-### Deployment contract
-
-- Integrate into `~/Source/kris-kvm/roles/chatto` using the RSS bridge deployment
-  pattern rather than releasebot's timer pattern.
-- Install in a dedicated subdirectory of the `chatto` account's home, such as
-  `~/threaddump`, with `tmpdir/` beneath that installation.
-- Install the pinned release and dependencies using Python 3.14 and
-  `uv sync --no-dev --locked`; run the installed bot executable in a permanent
-  user systemd service, not a timer.
-- Deploy the dotenv secret through the role's existing protected-secret pattern:
-  owned by `chatto`, mode `0600`, and Ansible `no_log` for secret handling.
-- Set the service's working directory/configuration so `python-dotenv` loads the
-  intended file. Do not commit plaintext credentials.
-- Follow the role's user-service enable/start, daemon-reload, and restart behavior
-  when the release, dependencies, configuration, or service unit changes.
-- Document the bot's required read, user-role lookup, attachment upload, and
-  message-post permissions against the target API, without adding membership or
-  permission changes to the bot itself.
-- Service supervision may restart a failed process. That restart does not recover
-  requests, replay missed events, or retry interrupted jobs.
-
-### Acceptance criteria
-
-1. Ansible installs and starts the bot as `chatto`, without root bot execution or
-   a periodic timer.
-2. A normal service start loads protected dotenv configuration and listens for
-   new requests; its temporary location is writable by `chatto`.
-3. Relevant deployment changes restart the service using the established role
-   convention; an unchanged deployment remains idempotent.
-4. Secrets are not exposed in repository content, Ansible output, or service logs.
-5. Documentation explains configuration, required permissions, lost requests during
-   downtime, queue saturation, ZIP publication, and no retry/recovery behavior.
-
-## API and deployment evidence
+## API evidence and hosting background
 
 The current repository pins `chattolib==0.5.0b10`. Target the documented Chatto
 `v0.5.0-beta.10` API, checking the installed descriptors and immutable server
@@ -369,8 +338,8 @@ tag rather than inventing compatibility with other releases.
   mention targets rather than a command span for each textual mention. Confirm
   that `@threaddump hello, @someone dump this` is intended to qualify when reviewing
   the behavior plan; do not silently implement a mention-adjacent parser.
-- The dotenv deployment path, installed release selector, operator-selected queue
-  capacity, and exact service naming belong in the deployment ticket plan.
+- Deployment configuration, release selection, and service naming are outside
+  this epic. Local dotenv loading and queue-capacity validation remain in scope.
 - Single-threaded reception plus sequential exports requires a scheduling approach
   that keeps event ingestion responsive. Select that approach in the ticket plan;
   do not introduce parallel export workers to solve it.
