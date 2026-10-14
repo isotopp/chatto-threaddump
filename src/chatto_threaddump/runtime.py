@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import signal
@@ -131,6 +132,16 @@ async def _run_with_shutdown(settings: Settings) -> None:
 
 def main() -> int:
     """Load dotenv configuration and run until shutdown or a stream failure."""
+    parser = argparse.ArgumentParser(
+        prog="chatto-threaddump",
+        description="Run the long-running Chatto thread dump bot.",
+        epilog=(
+            "Reads .env from the current working directory. Required settings: "
+            "CHATTO_THREADDUMP_SERVER_URL, CHATTO_THREADDUMP_API_KEY, "
+            "CHATTO_THREADDUMP_ROLE, and CHATTO_THREADDUMP_QUEUE_LENGTH."
+        ),
+    )
+    parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     try:
         settings = load_settings()

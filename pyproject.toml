@@ -1,7 +1,7 @@
 [project]
 name = "chatto-threaddump"
 version = "0.1.0"
-description = "Run a bot that publishes requested Chatto thread dumps"
+description = "Run the long-running Chatto thread dump bot"
 readme = "README.md"
 authors = [
     { name = "Kristian Koehntopp", email = "kris-git@koehntopp.de" }
